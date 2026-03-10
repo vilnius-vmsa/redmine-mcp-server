@@ -19,9 +19,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Set .env.docker
+      - name: Set .env
         run: |
-          cat << 'EOF' > .env.docker
+          cat << 'EOF' > .env
           ${{ secrets.ENV }}
           EOF
 

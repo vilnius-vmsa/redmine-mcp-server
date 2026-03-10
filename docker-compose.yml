@@ -9,7 +9,7 @@ services:
     ports:
       - "${SERVER_PORT:-8000}:${SERVER_PORT:-8000}"
     env_file:
-      - .env.docker
+      - .env
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
