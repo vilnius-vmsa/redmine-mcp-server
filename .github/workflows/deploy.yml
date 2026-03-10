@@ -24,6 +24,7 @@ jobs:
           cat << 'EOF' > .env
           ${{ secrets.ENV }}
           EOF
+          cp .env .env.docker
 
       - name: Deploy with docker compose
         run: |
