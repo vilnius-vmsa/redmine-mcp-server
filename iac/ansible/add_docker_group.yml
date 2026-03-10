@@ -1,0 +1,23 @@
+- name: Add user to docker group
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Add user to docker group
+      ansible.builtin.user:
+        name: "{{ username }}"
+        groups: docker
+        append: true
+      notify: Restart Docker
+
+    - name: Verify user is in docker group
+      command: groups {{ username }}
+      register: group_check
+      changed_when: false
+      failed_when: "'docker' not in group_check.stdout"
+
+  handlers:
+    - name: Restart Docker
+      service:
+        name: docker
+        state: restarted

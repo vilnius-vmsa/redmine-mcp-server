@@ -1,0 +1,120 @@
+name: Prepare Environment
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-ansible:
+    name: Setup Ansible
+    runs-on: self-hosted
+    steps:
+      - name: Check if Ansible is installed
+        run: |
+          if ! command -v ansible &> /dev/null; then
+            echo "Ansible is not installed. Installing..."
+            echo "ansible_installed=false" >> $GITHUB_ENV
+          else
+            echo "Ansible is already installed."
+            ansible --version
+            echo "ansible_installed=true" >> $GITHUB_ENV
+          fi
+
+      - name: End job if Ansible is installed
+        if: env.ansible_installed == 'true'
+        run: |
+          echo "Ansible is already installed. Version: $(ansible --version)"
+          exit 0
+
+      - name: Update apt repository
+        if: env.ansible_installed == 'false'
+        run: sudo apt-get update
+
+      - name: Install Ansible
+        if: env.ansible_installed == 'false'
+        run: sudo apt-get install -y ansible
+
+      - name: Verify Ansible installation
+        if: env.ansible_installed == 'false'
+        run: ansible --version
+
+  setup_docker:
+    name: Setup Docker
+    runs-on: self-hosted
+    needs: [setup-ansible]
+    steps:
+      - name: Validate Docker installation
+        id: validate_docker
+        run: |
+          if ! command -v docker &> /dev/null; then
+            echo "Docker is not installed"
+            echo "docker_installed=false" >> $GITHUB_ENV
+          else
+            docker --version
+            echo "docker_installed=true" >> $GITHUB_ENV
+          fi
+
+      - name: End job if Docker is installed
+        if: env.docker_installed == 'true'
+        run: |
+          echo "Docker is already installed. Version: $(docker --version)"
+          exit 0
+
+      - name: Checkout project repository
+        if: env.docker_installed == 'false'
+        uses: actions/checkout@v4
+
+      - name: Running Ansible playbook to install Docker
+        if: env.docker_installed == 'false'
+        run: ansible-playbook -i iac/ansible/inventory iac/ansible/install_docker.yml
+
+  setup_docker_compose:
+    name: Setup Docker Compose
+    runs-on: self-hosted
+    needs: [setup_docker]
+    steps:
+      - name: Validate Docker Compose installation
+        id: validate_docker_compose
+        run: |
+          if ! command -v docker-compose &> /dev/null; then
+            echo "Docker Compose is not installed"
+            echo "docker_compose_installed=false" >> $GITHUB_ENV
+          else
+            docker-compose --version
+            echo "docker_compose_installed=true" >> $GITHUB_ENV
+          fi
+
+      - name: End job if Docker Compose is installed
+        if: env.docker_compose_installed == 'true'
+        run: |
+          echo "Docker Compose is already installed. Version: $(docker-compose --version)"
+          exit 0
+
+      - name: Checkout project repository
+        if: env.docker_compose_installed == 'false'
+        uses: actions/checkout@v4
+
+      - name: Running Ansible playbook to install Docker Compose
+        if: env.docker_compose_installed == 'false'
+        run: ansible-playbook -i iac/ansible/inventory iac/ansible/install_docker_compose.yml
+
+  check_user_added_to_docker_group:
+    name: Check if user is added to Docker group
+    runs-on: self-hosted
+    needs: [setup_docker_compose]
+    steps:
+      - name: Checkout project repository
+        uses: actions/checkout@v4
+
+      - name: Check if user is in Docker group
+        run: ansible-playbook -i iac/ansible/inventory iac/ansible/add_docker_group.yml --extra-vars "username=${{ vars.UBUNTU_WEB_USER }}"
+
+  restart_runner_service:
+    name: Restart runner service
+    runs-on: self-hosted
+    needs: [check_user_added_to_docker_group]
+    continue-on-error: true
+    steps:
+      - name: Restart GitHub Actions runner service
+        run: |
+            REPO_ORG=$(echo "${{ github.repository }}" | cut -d'/' -f1)
+            REPO_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2)
+            sudo systemctl restart actions.runner.${REPO_ORG}-${REPO_NAME}.${{ runner.name }}.service

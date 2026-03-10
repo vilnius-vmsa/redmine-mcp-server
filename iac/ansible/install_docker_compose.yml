@@ -1,0 +1,55 @@
+- name: Ensure Docker Compose is installed
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Get system architecture
+      shell: "uname -s && uname -m"
+      register: uname_output
+    - name: Set Docker Compose URL
+      set_fact:
+        docker_compose_url: "https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-{{ uname_output.stdout_lines[0] }}-{{ uname_output.stdout_lines[1] }}"
+
+    - name: Define Docker Compose version variable
+      command: which docker-compose
+      register: docker_compose_path
+      ignore_errors: true
+
+    - name: Check Docker Compose version if installed
+      command: "{{ docker_compose_path.stdout }} --version"
+      register: docker_compose_version
+      when: docker_compose_path.stdout != ""
+      ignore_errors: true
+
+    - name: Output Docker Compose version if installed
+      debug:
+        msg: "Docker Compose is already installed. Version: {{ docker_compose_version.stdout }}"
+      when: docker_compose_path.stdout != "" and docker_compose_version.rc != 0
+
+    - name: Install Docker Compose if not installed
+      block:
+        - name: Update and upgrade the system
+          apt:
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Download Docker Compose
+          get_url:
+            url: "{{ docker_compose_url }}"
+            dest: /usr/local/bin/docker-compose
+            mode: '0755'
+
+        - name: Ensure Docker Compose is executable
+          file:
+            path: /usr/local/bin/docker-compose
+            mode: '0755'
+            state: file
+
+        - name: Verify Docker Compose installation
+          command: docker-compose --version
+          register: docker_compose_version
+
+        - name: Output Docker Compose version after installation
+          debug:
+            msg: "Docker Compose installed. Version: {{ docker_compose_version.stdout }}"
+      when: docker_compose_path.stdout == ""
