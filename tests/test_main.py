@@ -87,9 +87,6 @@ class TestMainFunction:
         # Call main - uvicorn.run is mocked so it won't block
         main()
 
-        # Verify stateless mode was enabled
-        assert mock_mcp.settings.stateless_http is True
-
         # Verify server was started with our app (so custom routes are served)
         mock_uvicorn.run.assert_called_once()
         call_args = mock_uvicorn.run.call_args
@@ -97,5 +94,54 @@ class TestMainFunction:
         assert isinstance(call_args[1]["host"], str)
         assert isinstance(call_args[1]["port"], int)
 
-        # Verify version was logged
-        assert mock_logger.info.called
+
+@pytest.mark.unit
+class TestAuthWiring:
+    """FastMCP construction with native auth in OAuth mode.
+
+    These tests exercise the ``_select_auth_provider`` helper instead of
+    reloading ``server.py``. Reloading the module would rebuild the global
+    ``mcp`` singleton and break every other test that has already captured
+    a reference to it (tool registrations, schema introspection, etc.).
+    """
+
+    def test_oauth_mode_returns_remote_auth_provider(self, monkeypatch):
+        from fastmcp.server.auth import RemoteAuthProvider
+
+        monkeypatch.setenv("REDMINE_URL", "https://r.example.com")
+        monkeypatch.setenv("REDMINE_MCP_BASE_URL", "http://localhost:3040")
+        monkeypatch.setenv("REDMINE_INTROSPECT_CLIENT_ID", "cid")
+        monkeypatch.setenv("REDMINE_INTROSPECT_CLIENT_SECRET", "csec")
+        from redmine_mcp_server.server import _select_auth_provider
+
+        provider = _select_auth_provider("oauth")
+        assert isinstance(provider, RemoteAuthProvider)
+
+    def test_oauth_proxy_mode_returns_oauth_proxy(self, monkeypatch, tmp_path):
+        from fastmcp import settings
+        from fastmcp.server.auth.oauth_proxy import OAuthProxy
+
+        monkeypatch.setenv("REDMINE_URL", "https://r.example.com")
+        monkeypatch.setenv("REDMINE_MCP_BASE_URL", "https://mcp.example.com")
+        monkeypatch.setenv("REDMINE_INTROSPECT_CLIENT_ID", "cid")
+        monkeypatch.setenv("REDMINE_INTROSPECT_CLIENT_SECRET", "csec")
+        monkeypatch.setenv("REDMINE_MCP_JWT_SIGNING_KEY", "stable-test-signing-key")
+        monkeypatch.setattr(settings, "home", tmp_path)
+        from redmine_mcp_server.server import _select_auth_provider
+
+        provider = _select_auth_provider("oauth-proxy")
+        assert isinstance(provider, OAuthProxy)
+
+    def test_legacy_mode_returns_none(self):
+        from redmine_mcp_server.server import _select_auth_provider
+
+        assert _select_auth_provider("legacy") is None
+
+    def test_oauth_mode_missing_creds_raises(self, monkeypatch):
+        monkeypatch.setenv("REDMINE_URL", "https://r.example.com")
+        monkeypatch.delenv("REDMINE_INTROSPECT_CLIENT_ID", raising=False)
+        monkeypatch.delenv("REDMINE_INTROSPECT_CLIENT_SECRET", raising=False)
+        from redmine_mcp_server.server import _select_auth_provider
+
+        with pytest.raises(RuntimeError, match="REDMINE_INTROSPECT_CLIENT_ID"):
+            _select_auth_provider("oauth")

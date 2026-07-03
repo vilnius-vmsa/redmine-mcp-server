@@ -14,9 +14,7 @@ import sys
 # Add the src directory to the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from redmine_mcp_server.redmine_handler import (  # noqa: E402
-    list_redmine_issues,
-)
+from redmine_mcp_server.tools.issues import list_redmine_issues  # noqa: E402
 
 
 class TestListRedmineIssues:
@@ -25,7 +23,7 @@ class TestListRedmineIssues:
     @pytest.fixture
     def mock_redmine(self):
         """Create a mock Redmine client."""
-        with patch("redmine_mcp_server.redmine_handler.redmine") as mock:
+        with patch("redmine_mcp_server._client.redmine") as mock:
             yield mock
 
     def create_mock_issue(self, issue_id=1, subject="Test Issue", project_id=1):
@@ -107,6 +105,21 @@ class TestListRedmineIssues:
         call_kwargs = mock_redmine.issue.filter.call_args[1]
         assert call_kwargs.get("status_id") == 2
         assert call_kwargs.get("project_id") == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sentinel", ["open", "closed", "*"])
+    async def test_list_issues_status_id_accepts_redmine_sentinels(
+        self, mock_redmine, sentinel
+    ):
+        """Test status_id accepts Redmine's open/closed/* sentinels (#107)."""
+        mock_redmine.issue.filter.return_value = self.create_mock_issues(1)
+
+        await list_redmine_issues(project_id=1, status_id=sentinel)
+
+        call_kwargs = mock_redmine.issue.filter.call_args[1]
+        # Sentinel must pass through unchanged so Redmine's /issues.json
+        # interprets it as the documented status filter shape.
+        assert call_kwargs.get("status_id") == sentinel
 
     @pytest.mark.asyncio
     async def test_list_issues_with_assigned_to_filter(self, mock_redmine):
@@ -430,37 +443,37 @@ class TestListRedmineIssues:
 
     @pytest.mark.asyncio
     async def test_no_client_returns_error(self):
-        """Test error when Redmine client is not initialized."""
+        """Error path returns the standard dict envelope (#117)."""
         with patch(
-            "redmine_mcp_server.redmine_handler._get_redmine_client",
+            "redmine_mcp_server.tools.issues._get_redmine_client",
             side_effect=RuntimeError("No Redmine authentication available"),
         ):
             result = await list_redmine_issues(project_id=1)
 
-            assert isinstance(result, list)
-            assert "error" in result[0]
+            assert isinstance(result, dict)
+            assert "error" in result
 
     @pytest.mark.asyncio
     async def test_api_error_returns_error(self, mock_redmine):
-        """Test error handling when API call fails."""
+        """Error path returns the standard dict envelope (#117)."""
         mock_redmine.issue.filter.side_effect = Exception("Connection refused")
 
         result = await list_redmine_issues(project_id=1)
 
-        assert isinstance(result, list)
-        assert "error" in result[0]
+        assert isinstance(result, dict)
+        assert "error" in result
 
     @pytest.mark.asyncio
     async def test_resource_not_found_error(self, mock_redmine):
-        """Test error handling for ResourceNotFoundError."""
+        """Error path returns the standard dict envelope (#117)."""
         from redminelib.exceptions import ResourceNotFoundError
 
         mock_redmine.issue.filter.side_effect = ResourceNotFoundError()
 
         result = await list_redmine_issues(project_id=999)
 
-        assert isinstance(result, list)
-        assert "error" in result[0]
+        assert isinstance(result, dict)
+        assert "error" in result
 
     # --- MCP parameter unwrapping ---
 

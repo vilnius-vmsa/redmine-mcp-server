@@ -13,9 +13,11 @@ import pytest
 # Add the src directory to the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from redmine_mcp_server.redmine_handler import (  # noqa: E402
+from redmine_mcp_server._client import (  # noqa: E402
     _get_redmine_client,
     REDMINE_URL,
+)
+from redmine_mcp_server.tools.time_tracking import (  # noqa: E402
     list_time_entry_activities,
 )
 
@@ -81,7 +83,7 @@ class TestRedmineIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_projects
+        from redmine_mcp_server.tools.projects import list_redmine_projects
 
         result = await list_redmine_projects()
 
@@ -110,9 +112,10 @@ class TestRedmineIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import get_redmine_issue
+        from redmine_mcp_server.tools.issues import (
+            get_redmine_issue,
+        )  # First, try to get any issue to test with
 
-        # First, try to get any issue to test with
         try:
             # Get the first project and see if it has issues
             projects = redmine.project.all()
@@ -165,7 +168,7 @@ class TestRedmineIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import get_redmine_issue
+        from redmine_mcp_server.tools.issues import get_redmine_issue
 
         try:
             projects = redmine.project.all()
@@ -204,7 +207,7 @@ class TestRedmineIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import get_redmine_issue
+        from redmine_mcp_server.tools.issues import get_redmine_issue
 
         try:
             projects = redmine.project.all()
@@ -241,7 +244,7 @@ class TestRedmineIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import (
+        from redmine_mcp_server.tools.issues import (  # noqa: E402
             create_redmine_issue,
             update_redmine_issue,
         )
@@ -289,10 +292,10 @@ class TestRedmineIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import (
-            get_redmine_attachment_download_url,
-            create_redmine_issue,
+        from redmine_mcp_server.tools.files import (
+            get_redmine_attachment,
         )
+        from redmine_mcp_server.tools.issues import create_redmine_issue
         import tempfile
         import os
 
@@ -396,10 +399,10 @@ class TestRedmineIntegration:
                     os.unlink(test_file_path)
 
             # Now test downloading the attachment
-            result = await get_redmine_attachment_download_url(attachment_id)
+            result = await get_redmine_attachment(attachment_id)
 
-            # Test the API format (HTTP download URLs)
-            assert "download_url" in result
+            # Test the API format (uri or file_path depending on mode)
+            assert "uri_type" in result
             assert "filename" in result
             assert "content_type" in result
             assert "size" in result
@@ -407,9 +410,8 @@ class TestRedmineIntegration:
             assert "attachment_id" in result
             assert result["attachment_id"] == attachment_id
 
-            # Verify the download URL is properly formatted
-            assert result["download_url"].startswith("http")
-            assert "/files/" in result["download_url"]
+            # In HTTP mode a URI is returned; in stdio mode a file_path is returned
+            assert "uri" in result or "file_path" in result
 
             # Verify file was actually downloaded to the attachments directory
             attachments_dir = "attachments"
@@ -440,14 +442,10 @@ class TestRedmineIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import (
-            create_redmine_wiki_page,
-            update_redmine_wiki_page,
-            delete_redmine_wiki_page,
-            get_redmine_wiki_page,
-        )
+        from redmine_mcp_server.tools.wiki import (
+            manage_redmine_wiki_page,
+        )  # Pick the first available project
 
-        # Pick the first available project
         projects = list(redmine.project.all())
         if not projects:
             pytest.skip("No projects available for testing")
@@ -457,7 +455,8 @@ class TestRedmineIntegration:
 
         try:
             # 1. Create a new wiki page
-            create_result = await create_redmine_wiki_page(
+            create_result = await manage_redmine_wiki_page(
+                action="create",
                 project_id=project_id,
                 wiki_page_title=wiki_title,
                 text="# Integration Test\n\nCreated by integration tests.",
@@ -479,7 +478,8 @@ class TestRedmineIntegration:
             assert create_result["version"] == 1
 
             # 2. Verify the page was created by reading it
-            read_result = await get_redmine_wiki_page(
+            read_result = await manage_redmine_wiki_page(
+                action="get",
                 project_id=project_id,
                 wiki_page_title=wiki_title,
             )
@@ -487,7 +487,8 @@ class TestRedmineIntegration:
             assert read_result["title"] == wiki_title
 
             # 3. Update the wiki page
-            update_result = await update_redmine_wiki_page(
+            update_result = await manage_redmine_wiki_page(
+                action="update",
                 project_id=project_id,
                 wiki_page_title=wiki_title,
                 text="# Integration Test Updated\n\nUpdated by integration tests.",
@@ -502,7 +503,8 @@ class TestRedmineIntegration:
             assert update_result["version"] >= 2  # Version should increment
 
             # 4. Delete the wiki page
-            delete_result = await delete_redmine_wiki_page(
+            delete_result = await manage_redmine_wiki_page(
+                action="delete",
                 project_id=project_id,
                 wiki_page_title=wiki_title,
             )
@@ -514,7 +516,8 @@ class TestRedmineIntegration:
             assert delete_result["title"] == wiki_title
 
             # 5. Verify the page was deleted
-            verify_result = await get_redmine_wiki_page(
+            verify_result = await manage_redmine_wiki_page(
+                action="get",
                 project_id=project_id,
                 wiki_page_title=wiki_title,
             )
@@ -526,7 +529,8 @@ class TestRedmineIntegration:
         finally:
             # Clean up: attempt to delete the wiki page if it still exists
             try:
-                await delete_redmine_wiki_page(
+                await manage_redmine_wiki_page(
+                    action="delete",
                     project_id=project_id,
                     wiki_page_title=wiki_title,
                 )
@@ -542,9 +546,10 @@ class TestRedmineIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import delete_redmine_wiki_page
+        from redmine_mcp_server.tools.wiki import (
+            manage_redmine_wiki_page,
+        )  # Pick the first available project
 
-        # Pick the first available project
         projects = list(redmine.project.all())
         if not projects:
             pytest.skip("No projects available for testing")
@@ -555,7 +560,8 @@ class TestRedmineIntegration:
         # Test delete on non-existent page - should return error
         # Note: Redmine's wiki update API has upsert behavior (creates if not exists),
         # so we only test delete for "not found" errors
-        delete_result = await delete_redmine_wiki_page(
+        delete_result = await manage_redmine_wiki_page(
+            action="delete",
             project_id=project_id,
             wiki_page_title=nonexistent_title,
         )
@@ -618,7 +624,7 @@ class TestListRedmineIssuesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_issues
+        from redmine_mcp_server.tools.issues import list_redmine_issues
 
         projects = list(redmine.project.all())
         if not projects:
@@ -643,7 +649,7 @@ class TestListRedmineIssuesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_issues
+        from redmine_mcp_server.tools.issues import list_redmine_issues
 
         projects = list(redmine.project.all())
         if not projects:
@@ -666,7 +672,7 @@ class TestListRedmineIssuesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_issues
+        from redmine_mcp_server.tools.issues import list_redmine_issues
 
         result = await list_redmine_issues()
 
@@ -681,7 +687,7 @@ class TestListRedmineIssuesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_issues
+        from redmine_mcp_server.tools.issues import list_redmine_issues
 
         result = await list_redmine_issues(limit=3)
 
@@ -697,7 +703,7 @@ class TestListRedmineIssuesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_issues
+        from redmine_mcp_server.tools.issues import list_redmine_issues
 
         page1 = await list_redmine_issues(limit=5, offset=0)
         page2 = await list_redmine_issues(limit=5, offset=5)
@@ -720,7 +726,7 @@ class TestListRedmineIssuesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_issues
+        from redmine_mcp_server.tools.issues import list_redmine_issues
 
         result = await list_redmine_issues(
             limit=5, offset=0, include_pagination_info=True
@@ -750,9 +756,10 @@ class TestListRedmineIssuesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_issues
+        from redmine_mcp_server.tools.issues import (
+            list_redmine_issues,
+        )  # status_id=1 is typically "New" in Redmine
 
-        # status_id=1 is typically "New" in Redmine
         result = await list_redmine_issues(status_id=1, limit=10)
 
         assert isinstance(result, list)
@@ -769,7 +776,7 @@ class TestListRedmineIssuesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_issues
+        from redmine_mcp_server.tools.issues import list_redmine_issues
 
         result = await list_redmine_issues(sort="updated_on:desc", limit=10)
 
@@ -791,7 +798,7 @@ class TestListRedmineIssuesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_issues
+        from redmine_mcp_server.tools.issues import list_redmine_issues
 
         result = await list_redmine_issues(limit=5, fields=["id", "subject", "status"])
 
@@ -813,7 +820,7 @@ class TestListRedmineIssuesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_issues
+        from redmine_mcp_server.tools.issues import list_redmine_issues
 
         projects = list(redmine.project.all())
         if not projects:
@@ -839,7 +846,7 @@ class TestListRedmineIssuesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_issues
+        from redmine_mcp_server.tools.issues import list_redmine_issues
 
         projects = list(redmine.project.all())
         if not projects:
@@ -878,7 +885,7 @@ class TestListRedmineIssuesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_issues
+        from redmine_mcp_server.tools.issues import list_redmine_issues
 
         projects = list(redmine.project.all())
         if not projects:
@@ -912,7 +919,7 @@ class TestListRedmineIssuesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_issues
+        from redmine_mcp_server.tools.issues import list_redmine_issues
 
         result = await list_redmine_issues(limit=1)
 
@@ -944,7 +951,7 @@ class TestListRedmineIssuesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_issues
+        from redmine_mcp_server.tools.issues import list_redmine_issues
 
         result = await list_redmine_issues(assigned_to_id="me", limit=10)
 
@@ -960,7 +967,7 @@ class TestEnvironmentConfiguration:
 
     def test_environment_variables_loaded(self):
         """Test that environment variables are properly loaded."""
-        from redmine_mcp_server.redmine_handler import (
+        from redmine_mcp_server._client import (  # noqa: E402
             REDMINE_URL,
             REDMINE_USERNAME,
             REDMINE_API_KEY,
@@ -1005,7 +1012,7 @@ class TestListRedmineVersionsIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_versions
+        from redmine_mcp_server.tools.projects import list_redmine_versions
 
         projects = list(redmine.project.all())
         if not projects:
@@ -1028,7 +1035,7 @@ class TestListRedmineVersionsIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_versions
+        from redmine_mcp_server.tools.projects import list_redmine_versions
 
         projects = list(redmine.project.all())
         if not projects:
@@ -1050,7 +1057,7 @@ class TestListRedmineVersionsIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_versions
+        from redmine_mcp_server.tools.projects import list_redmine_versions
 
         projects = list(redmine.project.all())
         if not projects:
@@ -1089,7 +1096,7 @@ class TestListRedmineVersionsIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_versions
+        from redmine_mcp_server.tools.projects import list_redmine_versions
 
         projects = list(redmine.project.all())
         if not projects:
@@ -1113,14 +1120,13 @@ class TestListRedmineVersionsIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_versions
+        from redmine_mcp_server.tools.projects import list_redmine_versions
 
         result = await list_redmine_versions(project_id=1, status_filter="invalid")
 
-        assert isinstance(result, list)
-        assert len(result) == 1
-        assert "error" in result[0]
-        assert "invalid" in result[0]["error"].lower()
+        assert isinstance(result, dict)
+        assert "error" in result
+        assert "invalid" in result["error"].lower()
 
     @pytest.mark.skipif(not REDMINE_URL, reason="REDMINE_URL not configured")
     @pytest.mark.integration
@@ -1131,13 +1137,12 @@ class TestListRedmineVersionsIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_redmine_versions
+        from redmine_mcp_server.tools.projects import list_redmine_versions
 
         result = await list_redmine_versions(project_id=999999)
 
-        assert isinstance(result, list)
-        assert len(result) == 1
-        assert "error" in result[0]
+        assert isinstance(result, dict)
+        assert "error" in result
 
 
 class TestListProjectMembersIntegration:
@@ -1152,7 +1157,7 @@ class TestListProjectMembersIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_project_members
+        from redmine_mcp_server.tools.projects import list_project_members
 
         projects = list(redmine.project.all())
         if not projects:
@@ -1175,7 +1180,7 @@ class TestListProjectMembersIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_project_members
+        from redmine_mcp_server.tools.projects import list_project_members
 
         projects = list(redmine.project.all())
         if not projects:
@@ -1197,7 +1202,7 @@ class TestListProjectMembersIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_project_members
+        from redmine_mcp_server.tools.projects import list_project_members
 
         projects = list(redmine.project.all())
         if not projects:
@@ -1229,13 +1234,12 @@ class TestListProjectMembersIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_project_members
+        from redmine_mcp_server.tools.projects import list_project_members
 
         result = await list_project_members(project_id=999999)
 
-        assert isinstance(result, list)
-        assert len(result) == 1
-        assert "error" in result[0]
+        assert isinstance(result, dict)
+        assert "error" in result
 
 
 class TestTimeEntriesIntegration:
@@ -1250,7 +1254,7 @@ class TestTimeEntriesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_time_entries
+        from redmine_mcp_server.tools.time_tracking import list_time_entries
 
         result = await list_time_entries(limit=5)
 
@@ -1270,15 +1274,13 @@ class TestTimeEntriesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_time_entries
+        from redmine_mcp_server.tools.time_tracking import list_time_entries
 
         projects = list(redmine.project.all())
         if not projects:
             pytest.skip("No projects available for testing")
 
-        result = await list_time_entries(
-            project_id=projects[0].identifier, limit=5
-        )
+        result = await list_time_entries(project_id=projects[0].identifier, limit=5)
 
         assert isinstance(result, list)
         for entry in result:
@@ -1296,7 +1298,7 @@ class TestTimeEntriesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_time_entries
+        from redmine_mcp_server.tools.time_tracking import list_time_entries
 
         result = await list_time_entries(user_id="me", limit=5)
 
@@ -1316,9 +1318,9 @@ class TestTimeEntriesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import (
-            create_time_entry,
+        from redmine_mcp_server.tools.time_tracking import (  # noqa: E402
             list_time_entries,
+            manage_time_entry,
         )
 
         # Ensure at least one time entry exists
@@ -1327,7 +1329,8 @@ class TestTimeEntriesIntegration:
         activity_id = _get_activity_id(redmine)
         assert activity_id is not None, "No time entry activities configured"
 
-        created = await create_time_entry(
+        created = await manage_time_entry(
+            action="create",
             hours=0.1,
             project_id=projects[0].id,
             activity_id=activity_id,
@@ -1368,7 +1371,7 @@ class TestTimeEntriesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import list_time_entries
+        from redmine_mcp_server.tools.time_tracking import list_time_entries
 
         page1 = await list_time_entries(limit=3, offset=0)
 
@@ -1396,12 +1399,10 @@ class TestTimeEntriesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import (
-            create_time_entry,
-            update_time_entry,
-        )
+        from redmine_mcp_server.tools.time_tracking import (
+            manage_time_entry,
+        )  # Pick the first available project
 
-        # Pick the first available project
         projects = list(redmine.project.all())
         assert projects, "No projects available for testing"
         project_id = projects[0].id
@@ -1413,7 +1414,8 @@ class TestTimeEntriesIntegration:
         time_entry_id = None
         try:
             # 1. Create a time entry
-            create_result = await create_time_entry(
+            create_result = await manage_time_entry(
+                action="create",
                 hours=0.25,
                 project_id=project_id,
                 activity_id=activity_id,
@@ -1435,7 +1437,8 @@ class TestTimeEntriesIntegration:
             time_entry_id = create_result["id"]
 
             # 2. Update the time entry
-            update_result = await update_time_entry(
+            update_result = await manage_time_entry(
+                action="update",
                 time_entry_id=time_entry_id,
                 hours=0.5,
                 comments="Integration test time entry (updated)",
@@ -1466,15 +1469,16 @@ class TestTimeEntriesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import create_time_entry
+        from redmine_mcp_server.tools.time_tracking import (
+            manage_time_entry,
+        )  # Missing both project_id and issue_id
 
-        # Missing both project_id and issue_id
-        result = await create_time_entry(hours=1.0)
+        result = await manage_time_entry(action="create", hours=1.0)
         assert "error" in result
         assert "project_id or issue_id" in result["error"]
 
         # Negative hours
-        result = await create_time_entry(hours=-1.0, project_id=1)
+        result = await manage_time_entry(action="create", hours=-1.0, project_id=1)
         assert "error" in result
         assert "positive" in result["error"]
 
@@ -1491,9 +1495,9 @@ class TestListProjectIssueCustomFieldsIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import (
+        from redmine_mcp_server.tools.projects import (
             list_project_issue_custom_fields,
-        )
+        )  # noqa: E402
 
         projects = list(redmine.project.all())
         assert projects, "No projects available"
@@ -1515,9 +1519,9 @@ class TestListProjectIssueCustomFieldsIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import (
+        from redmine_mcp_server.tools.projects import (
             list_project_issue_custom_fields,
-        )
+        )  # noqa: E402
 
         projects = list(redmine.project.all())
         assert projects, "No projects available"
@@ -1547,17 +1551,16 @@ class TestListProjectIssueCustomFieldsIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import (
+        from redmine_mcp_server.tools.projects import (
             list_project_issue_custom_fields,
-        )
+        )  # noqa: E402
 
         result = await list_project_issue_custom_fields(
             project_id="nonexistent-project-xyz-99999"
         )
 
-        assert isinstance(result, list)
-        assert len(result) == 1
-        assert "error" in result[0]
+        assert isinstance(result, dict)
+        assert "error" in result
 
 
 class TestSearchRedmineIssuesIntegration:
@@ -1572,7 +1575,7 @@ class TestSearchRedmineIssuesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import search_redmine_issues
+        from redmine_mcp_server.tools.issues import search_redmine_issues
 
         result = await search_redmine_issues("test", limit=5)
 
@@ -1590,7 +1593,7 @@ class TestSearchRedmineIssuesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import search_redmine_issues
+        from redmine_mcp_server.tools.issues import search_redmine_issues
 
         result = await search_redmine_issues(
             "test", limit=2, include_pagination_info=True
@@ -1610,11 +1613,9 @@ class TestSearchRedmineIssuesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import search_redmine_issues
+        from redmine_mcp_server.tools.issues import search_redmine_issues
 
-        result = await search_redmine_issues(
-            "zzz_nonexistent_xyzzy_999", limit=5
-        )
+        result = await search_redmine_issues("zzz_nonexistent_xyzzy_999", limit=5)
 
         assert isinstance(result, list)
         assert len(result) == 0
@@ -1632,14 +1633,12 @@ class TestSummarizeProjectStatusIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import summarize_project_status
+        from redmine_mcp_server.tools.projects import summarize_project_status
 
         projects = list(redmine.project.all())
         assert projects, "No projects available"
 
-        result = await summarize_project_status(
-            project_id=projects[0].id, days=30
-        )
+        result = await summarize_project_status(project_id=projects[0].id, days=30)
 
         assert isinstance(result, dict)
         if "error" in result:
@@ -1657,14 +1656,12 @@ class TestSummarizeProjectStatusIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import summarize_project_status
+        from redmine_mcp_server.tools.projects import summarize_project_status
 
         projects = list(redmine.project.all())
         assert projects, "No projects available"
 
-        result = await summarize_project_status(
-            project_id=projects[0].id, days=7
-        )
+        result = await summarize_project_status(project_id=projects[0].id, days=7)
 
         assert isinstance(result, dict)
         if "error" in result:
@@ -1690,7 +1687,7 @@ class TestSummarizeProjectStatusIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import summarize_project_status
+        from redmine_mcp_server.tools.projects import summarize_project_status
 
         result = await summarize_project_status(project_id=999999, days=30)
 
@@ -1710,7 +1707,7 @@ class TestSearchEntireRedmineIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import search_entire_redmine
+        from redmine_mcp_server.tools.search import search_entire_redmine
 
         result = await search_entire_redmine(query="test", limit=5)
 
@@ -1730,7 +1727,7 @@ class TestSearchEntireRedmineIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import search_entire_redmine
+        from redmine_mcp_server.tools.search import search_entire_redmine
 
         result = await search_entire_redmine(
             query="test", resources=["issues"], limit=5
@@ -1751,7 +1748,7 @@ class TestSearchEntireRedmineIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import search_entire_redmine
+        from redmine_mcp_server.tools.search import search_entire_redmine
 
         result = await search_entire_redmine(
             query="test", resources=["wiki_pages"], limit=5
@@ -1772,11 +1769,9 @@ class TestSearchEntireRedmineIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import search_entire_redmine
+        from redmine_mcp_server.tools.search import search_entire_redmine
 
-        result = await search_entire_redmine(
-            query="zzz_nonexistent_xyzzy_999", limit=5
-        )
+        result = await search_entire_redmine(query="zzz_nonexistent_xyzzy_999", limit=5)
 
         assert isinstance(result, dict)
         if "error" in result:
@@ -1797,7 +1792,7 @@ class TestCleanupAttachmentFilesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import cleanup_attachment_files
+        from redmine_mcp_server.tools.files import cleanup_attachment_files
 
         result = await cleanup_attachment_files()
 
@@ -1817,7 +1812,7 @@ class TestCleanupAttachmentFilesIntegration:
         if redmine is None:
             pytest.skip("Redmine client not initialized")
 
-        from redmine_mcp_server.redmine_handler import cleanup_attachment_files
+        from redmine_mcp_server.tools.files import cleanup_attachment_files
 
         result = await cleanup_attachment_files()
 
@@ -1865,6 +1860,168 @@ class TestEnumerationsIntegration:
         assert "is_default" in activity
         assert isinstance(activity["id"], int)
         assert isinstance(activity["name"], str)
+
+
+_AGILE_SKIP = pytest.mark.skipif(
+    not REDMINE_URL
+    or os.getenv("REDMINE_AGILE_ENABLED", "false").strip().lower()
+    not in {"1", "true", "yes", "on"},
+    reason="REDMINE_URL not configured or REDMINE_AGILE_ENABLED not true",
+)
+
+
+class TestAgilePluginIntegration:
+    """Integration tests for RedmineUP Agile plugin support.
+
+    Requires:
+    - REDMINE_URL configured
+    - REDMINE_AGILE_ENABLED=true
+    - RedmineUP Agile plugin installed on the Redmine server
+    - The 'agile' module enabled for the test project (Project Settings → Modules)
+    """
+
+    def _find_agile_issue_id(self, redmine):
+        """Find an issue in a project with the agile module enabled."""
+        project_id = os.getenv("REDMINE_AGILE_TEST_PROJECT_ID")
+        if project_id:
+            try:
+                issues = redmine.issue.filter(project_id=project_id, limit=1)
+                if issues:
+                    return list(issues)[0].id
+            except Exception:
+                pass
+            pytest.skip(
+                f"No issues found in REDMINE_AGILE_TEST_PROJECT_ID={project_id}"
+            )
+
+        # Fall back: try each project until one returns agile data without 403
+        try:
+            projects = list(redmine.project.all())
+        except Exception:
+            pytest.skip("Could not list projects")
+
+        for project in projects:
+            try:
+                issues = redmine.issue.filter(project_id=project.id, limit=1)
+                issue_list = list(issues)
+                if not issue_list:
+                    continue
+                issue_id = issue_list[0].id
+                # Probe agile endpoint — skip project on 403
+                from redminelib.exceptions import ForbiddenError
+
+                try:
+                    url = f"{REDMINE_URL}/issues/{issue_id}/agile_data.json"
+                    redmine.engine.request("get", url)
+                    return issue_id
+                except ForbiddenError:
+                    continue
+            except Exception:
+                continue
+
+        pytest.skip(
+            "No project with Agile module enabled found. "
+            "Enable the 'agile' module in at least one project."
+        )
+
+    @_AGILE_SKIP
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_get_issue_includes_agile_fields(self):
+        """get_redmine_issue returns agile fields when REDMINE_AGILE_ENABLED=true."""
+        redmine = _get_redmine_or_none()
+        if redmine is None:
+            pytest.skip("Redmine client not initialized")
+
+        issue_id = self._find_agile_issue_id(redmine)
+
+        from redmine_mcp_server.tools.issues import get_redmine_issue
+
+        result = await get_redmine_issue(issue_id)
+
+        assert "error" not in result, f"get_redmine_issue failed: {result}"
+        assert "story_points" in result, "story_points missing from result"
+        assert "agile_sprint_id" in result, "agile_sprint_id missing from result"
+        assert "agile_position" in result, "agile_position missing from result"
+        # Values may be None (not yet set) — presence of keys is what matters
+        assert result.get("story_points") is None or isinstance(
+            result["story_points"], (int, float)
+        )
+
+    @_AGILE_SKIP
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_update_story_points_roundtrip(self):
+        """update_redmine_issue sets story_points and get_redmine_issue reads it back."""  # noqa: E501
+        redmine = _get_redmine_or_none()
+        if redmine is None:
+            pytest.skip("Redmine client not initialized")
+
+        issue_id = self._find_agile_issue_id(redmine)
+
+        from redmine_mcp_server.tools.issues import (  # noqa: E402
+            get_redmine_issue,
+            update_redmine_issue,
+        )
+
+        # Set story points to a known value
+        update_result = await update_redmine_issue(issue_id, {"story_points": 5})
+        assert "error" not in update_result, f"update failed: {update_result}"
+
+        # Read back and confirm
+        get_result = await get_redmine_issue(issue_id)
+        assert "error" not in get_result, f"get failed: {get_result}"
+        assert get_result.get("story_points") == 5
+
+    @_AGILE_SKIP
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_clear_story_points(self):
+        """update_redmine_issue with story_points=None clears the field."""
+        redmine = _get_redmine_or_none()
+        if redmine is None:
+            pytest.skip("Redmine client not initialized")
+
+        issue_id = self._find_agile_issue_id(redmine)
+
+        from redmine_mcp_server.tools.issues import (  # noqa: E402
+            get_redmine_issue,
+            update_redmine_issue,
+        )
+
+        # First set a value so there's something to clear
+        await update_redmine_issue(issue_id, {"story_points": 3})
+
+        # Now clear it
+        update_result = await update_redmine_issue(issue_id, {"story_points": None})
+        assert "error" not in update_result, f"clear failed: {update_result}"
+
+        # Read back and confirm cleared
+        get_result = await get_redmine_issue(issue_id)
+        assert "error" not in get_result
+        assert get_result.get("story_points") is None
+
+    @_AGILE_SKIP
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_story_points_not_leaked_to_standard_update(self):
+        """story_points in fields dict does not cause a standard update failure."""
+        redmine = _get_redmine_or_none()
+        if redmine is None:
+            pytest.skip("Redmine client not initialized")
+
+        issue_id = self._find_agile_issue_id(redmine)
+
+        from redmine_mcp_server.tools.issues import (
+            update_redmine_issue,
+        )  # Passing story_points together with a standard field must not error
+
+        result = await update_redmine_issue(
+            issue_id, {"story_points": 8, "notes": "agile integration test"}
+        )
+        assert (
+            "error" not in result
+        ), f"Combined story_points + notes update failed: {result}"
 
 
 if __name__ == "__main__":

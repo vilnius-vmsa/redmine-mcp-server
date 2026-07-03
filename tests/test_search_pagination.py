@@ -13,7 +13,7 @@ import sys
 # Add the src directory to the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from redmine_mcp_server.redmine_handler import search_redmine_issues  # noqa: E402
+from redmine_mcp_server.tools.issues import search_redmine_issues  # noqa: E402
 
 
 class TestSearchRedmineIssuesPagination:
@@ -22,7 +22,7 @@ class TestSearchRedmineIssuesPagination:
     @pytest.fixture
     def mock_redmine(self):
         """Create a mock Redmine client."""
-        with patch("redmine_mcp_server.redmine_handler.redmine") as mock:
+        with patch("redmine_mcp_server._client.redmine") as mock:
             yield mock
 
     def create_mock_issue(self, issue_id=1, subject="Test Issue"):
@@ -333,7 +333,7 @@ class TestSearchRedmineIssuesPagination:
         mock_redmine.issue.search.return_value = mock_issues
 
         result = await search_redmine_issues(  # noqa: F841
-            "bug", limit=10, custom_param="value"
+            "bug", limit=10, options={"custom_param": "value"}
         )
 
         # Verify custom parameter was passed through

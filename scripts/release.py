@@ -13,18 +13,22 @@ Examples:
 
 Gitflow:
     1. Start from develop branch
-    2. Create release/vX.Y.Z branch
-    3. Bump versions on release branch
-    4. Merge to master and tag
-    5. Create GitHub release (triggers PyPI publish)
-    6. Publish to MCP Registry
-    7. Merge back to develop
-    8. Delete release branch
+    2. Pre-flight: clean tree, tests pass, dependency audit clean
+    3. Create release/vX.Y.Z branch and bump versions
+    4. Draft + approve release notes via claude -p (persisted for recovery)
+    5. Merge to master, push tag (triggers publish-pypi.yml)
+    6. Wait for publish-pypi workflow to finish (poll gh run status)
+    7. Wait for the version to appear on PyPI (JSON API)
+    8. Create GitHub release (only after `pip install` will actually work)
+    9. Publish to MCP Registry
+    10. Merge back to develop, delete release branch, remove notes drafts
 """
 
 import argparse
 import json
+import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -43,6 +47,7 @@ class ReleaseConfig:
     bump_type: str
     dry_run: bool
     project_root: Path
+    hotfix: bool = False
 
 
 def run_command(
@@ -52,13 +57,16 @@ def run_command(
     capture_output: bool = True,
     dry_run: bool = False,
     dry_run_msg: str | None = None,
+    env: dict | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a shell command with optional dry-run support."""
     if dry_run and dry_run_msg:
         print(f"  [DRY-RUN] Would run: {' '.join(cmd)}")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-    result = subprocess.run(cmd, capture_output=capture_output, text=True, check=False)
+    result = subprocess.run(
+        cmd, capture_output=capture_output, text=True, check=False, env=env
+    )
     if check and result.returncode != 0:
         print(f"Error running command: {' '.join(cmd)}")
         print(f"  stdout: {result.stdout}")
@@ -100,7 +108,7 @@ def calculate_new_version(current: str, bump_type: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def preflight_checks() -> None:
+def preflight_checks(config: ReleaseConfig) -> None:
     """Verify prerequisites for release."""
     print("\n=== Pre-flight Checks ===\n")
 
@@ -113,22 +121,37 @@ def preflight_checks() -> None:
         sys.exit(1)
     print("  ✓ Working directory is clean")
 
-    # Check we're on develop branch
+    # Check we're on the correct branch
     print("Checking current branch...")
     result = run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"])
     branch = result.stdout.strip()
-    if branch != "develop":
-        print(
-            f"Error: Must be on 'develop' branch to start release, "
-            f"currently on '{branch}'"
-        )
-        sys.exit(1)
-    print("  ✓ On develop branch")
 
-    # Pull latest changes
-    print("Pulling latest changes...")
-    run_command(["git", "pull", "origin", "develop"])
-    print("  ✓ Up to date with origin/develop")
+    if config.hotfix:
+        if not branch.startswith("hotfix/"):
+            print(
+                f"Error: --hotfix requires a hotfix/* branch, "
+                f"currently on '{branch}'"
+            )
+            sys.exit(1)
+        print(f"  ✓ On hotfix branch: {branch}")
+
+        # Pull latest master
+        print("Pulling latest changes from master...")
+        run_command(["git", "pull", "origin", "master"])
+        print("  ✓ Up to date with origin/master")
+    else:
+        if branch != "develop":
+            print(
+                f"Error: Must be on 'develop' branch to start release, "
+                f"currently on '{branch}'"
+            )
+            sys.exit(1)
+        print("  ✓ On develop branch")
+
+        # Pull latest changes
+        print("Pulling latest changes...")
+        run_command(["git", "pull", "origin", "develop"])
+        print("  ✓ Up to date with origin/develop")
 
     # Check code formatting
     print("Checking code formatting...")
@@ -170,6 +193,40 @@ def preflight_checks() -> None:
         sys.exit(1)
     print("  ✓ All tests pass")
 
+    # Dependency audit -- same script CI runs (dependency-audit.yml and the
+    # publish-pypi.yml pre-test step both call scripts/audit.sh). A green
+    # preflight means a green publish-pypi audit step, so we catch the
+    # failure mode where pip-audit blocks the release after the tag has
+    # already been pushed.
+    print("Auditing dependencies...")
+    audit_script = config.project_root / "scripts" / "audit.sh"
+    requirements_path = "/tmp/requirements-audit.txt"
+    export_result = run_command(
+        ["uv", "export", "--no-hashes", "--no-emit-project"],
+        check=False,
+        capture_output=True,
+    )
+    if export_result.returncode != 0:
+        print("Error: uv export failed; cannot run dependency audit.")
+        print(export_result.stdout)
+        print(export_result.stderr)
+        sys.exit(1)
+    Path(requirements_path).write_text(export_result.stdout)
+    result = run_command(
+        ["bash", str(audit_script), "-r", requirements_path, "--strict"],
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        print(
+            "Error: Dependency audit failed. "
+            "Fix or update the ignore list in scripts/audit.sh before releasing."
+        )
+        print(result.stdout)
+        print(result.stderr)
+        sys.exit(1)
+    print("  ✓ No vulnerabilities (or all are in the ignore list)")
+
     # Check gh CLI is available and authenticated
     print("Checking gh CLI...")
     result = run_command(["which", "gh"], check=False)
@@ -185,7 +242,10 @@ def preflight_checks() -> None:
             sys.exit(1)
     print("  ✓ gh CLI available and authenticated")
 
-    # Check mcp-publisher is available
+    # Check mcp-publisher is installed. Authentication is deferred to the
+    # publish step (publish_mcp_registry): the Registry JWT is short-lived,
+    # so a token minted here would expire during the publish-workflow and
+    # PyPI waits before publish actually runs.
     print("Checking mcp-publisher...")
     result = run_command(["which", "mcp-publisher"], check=False)
     if result.returncode != 0:
@@ -195,23 +255,7 @@ def preflight_checks() -> None:
         )
         print("         Install with: brew install mcp-publisher")
     else:
-        result = run_command(
-            ["mcp-publisher", "validate"],
-            check=False,
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            print("  ⚠ mcp-publisher not authenticated. Starting login...")
-            login_result = subprocess.run(
-                ["mcp-publisher", "login", "github"], check=False
-            )
-            if login_result.returncode != 0:
-                print("Warning: mcp-publisher authentication failed.")
-                print("         MCP Registry publish may be skipped.")
-            else:
-                print("  ✓ mcp-publisher authenticated")
-        else:
-            print("  ✓ mcp-publisher available")
+        print("  ✓ mcp-publisher available (auth happens at publish time)")
 
 
 # ---------------------------------------------------------------------------
@@ -219,9 +263,7 @@ def preflight_checks() -> None:
 # ---------------------------------------------------------------------------
 
 
-def update_pyproject_toml(
-    project_root: Path, new_version: str, dry_run: bool
-) -> None:
+def update_pyproject_toml(project_root: Path, new_version: str, dry_run: bool) -> None:
     """Update version in pyproject.toml."""
     pyproject = project_root / "pyproject.toml"
     content = pyproject.read_text()
@@ -239,9 +281,7 @@ def update_pyproject_toml(
         print("  ✓ Updated pyproject.toml")
 
 
-def update_server_json(
-    project_root: Path, new_version: str, dry_run: bool
-) -> None:
+def update_server_json(project_root: Path, new_version: str, dry_run: bool) -> None:
     """Update version in server.json (both occurrences)."""
     server_json = project_root / "server.json"
     content = json.loads(server_json.read_text())
@@ -258,37 +298,65 @@ def update_server_json(
 
 
 def update_changelog(project_root: Path, new_version: str, dry_run: bool) -> None:
-    """Update CHANGELOG.md: convert [Unreleased] to new version with date."""
+    """Update CHANGELOG.md: convert [Unreleased] to new version with date.
+
+    Requires an [Unreleased] section with real content. Auto-stamping a
+    "Version bump" placeholder produces vacuous GitHub release notes; fail
+    loud instead so the user fills it in before the release goes out.
+    """
     changelog = project_root / "CHANGELOG.md"
     content = changelog.read_text()
     today = date.today().strftime("%Y-%m-%d")
 
-    # Check if there's an [Unreleased] section to convert
-    unreleased_pattern = r"## \[Unreleased\]\s*\n"
-    if re.search(unreleased_pattern, content, re.IGNORECASE):
-        # Replace [Unreleased] with new version, add fresh [Unreleased] above
-        new_content = re.sub(
-            unreleased_pattern,
-            f"## [Unreleased]\n\n## [{new_version}] - {today}\n",
-            content,
-            flags=re.IGNORECASE,
+    # Require an [Unreleased] section that exists and has real content.
+    unreleased_body_pattern = r"## \[Unreleased\]\s*\n(.*?)(?=^## \[|\Z)"
+    body_match = re.search(
+        unreleased_body_pattern, content, re.IGNORECASE | re.DOTALL | re.MULTILINE
+    )
+    if not body_match:
+        print(
+            "Error: CHANGELOG.md has no [Unreleased] section.\n"
+            "Add one with the changes for this release before running the script."
         )
-    else:
-        # No Unreleased section — add new version after header
-        first_version_match = re.search(
-            r"^## \[\d+\.\d+\.\d+\]", content, re.MULTILINE
+        sys.exit(1)
+
+    unreleased_body = body_match.group(1).strip()
+    if not unreleased_body or unreleased_body in (
+        "### Changed",
+        "### Added",
+        "### Fixed",
+        "### Security",
+    ):
+        print(
+            "Error: [Unreleased] section in CHANGELOG.md is empty.\n"
+            "Document the changes for this release before running the script."
         )
-        if first_version_match:
-            insert_pos = first_version_match.start()
-            new_section = (
-                f"## [Unreleased]\n\n"
-                f"## [{new_version}] - {today}\n\n"
-                f"### Changed\n- Version bump\n\n"
+        sys.exit(1)
+
+    # Replace [Unreleased] with new version, add fresh [Unreleased] above.
+    new_content = re.sub(
+        r"## \[Unreleased\]\s*\n",
+        f"## [Unreleased]\n\n## [{new_version}] - {today}\n",
+        content,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
+    # Append reference link at the bottom if not already present
+    ref_link = (
+        f"[{new_version}]: "
+        f"https://github.com/{GITHUB_REPO}/releases/tag/v{new_version}"
+    )
+    if ref_link not in new_content:
+        # Insert before the first existing reference link line
+        first_ref_match = re.search(r"^\[[\d.]+\]: https://", new_content, re.MULTILINE)
+        if first_ref_match:
+            insert_pos = first_ref_match.start()
+            new_content = (
+                new_content[:insert_pos] + ref_link + "\n" + new_content[insert_pos:]
             )
-            new_content = content[:insert_pos] + new_section + content[insert_pos:]
         else:
-            print("Error: Could not find where to insert new version in CHANGELOG.md")
-            sys.exit(1)
+            new_content = new_content.rstrip() + "\n" + ref_link + "\n"
 
     if dry_run:
         print(f"  [DRY-RUN] Would update CHANGELOG.md with version {new_version}")
@@ -312,25 +380,16 @@ def update_uv_lock(project_root: Path, dry_run: bool) -> None:
         print("  ✓ Updated uv.lock")
 
 
-def extract_changelog_section(project_root: Path, version: str) -> str:
-    """Extract the changelog section for a specific version.
+def _split_contributors(section: str) -> tuple[str, str]:
+    """Split a changelog section into (main_body, acknowledgements).
 
-    Returns a tuple-like pair: (main_body, acknowledgements).
-    The Contributors subsection is split out and reformatted as an
-    Acknowledgements block that matches the existing release style.
+    The ### Contributors subsection is removed from the body and reformatted
+    as an Acknowledgements block that matches the existing release style.
+    Contributor credits are NEVER rewritten by the LLM: keeping this
+    deterministic preserves @-mentions and PR links verbatim.
     """
-    changelog = project_root / "CHANGELOG.md"
-    content = changelog.read_text()
+    section = section.strip()
 
-    pattern = rf"## \[{re.escape(version)}\][^\n]*\n(.*?)(?=\n## \[|\Z)"
-    match = re.search(pattern, content, re.DOTALL)
-
-    if not match:
-        return "Release " + version, ""
-
-    section = match.group(1).strip()
-
-    # Split out ### Contributors into a separate acknowledgements block
     contrib_pattern = r"### Contributors\s*\n(.*?)(?=\n###\s|\Z)"
     contrib_match = re.search(contrib_pattern, section, re.DOTALL)
 
@@ -352,10 +411,11 @@ def extract_changelog_section(project_root: Path, version: str) -> str:
         line = line.strip()
         if not line.startswith("- "):
             continue
-        # Format: "- @username — description ([#PR](url))"
-        author_match = re.match(
-            r"-\s+(@\S+)\s*[—–-]\s*(.*)", line
-        )
+        # Format: "- @username: description ([#PR](url))"
+        # Accept colon and comma (current styles, per the no-em-dash writing
+        # rule), as well as em dash / en dash / hyphen for older CHANGELOG
+        # entries.
+        author_match = re.match(r"-\s+(@\S+)\s*[—–\-:,]\s*(.*)", line)
         if author_match:
             author = author_match.group(1)
             desc = author_match.group(2).strip()
@@ -372,6 +432,40 @@ def extract_changelog_section(project_root: Path, version: str) -> str:
         ack_lines.append("")
 
     return body, "\n".join(ack_lines).strip()
+
+
+def extract_changelog_section(project_root: Path, version: str) -> tuple[str, str]:
+    """Extract the changelog section for a specific version.
+
+    Returns (main_body, acknowledgements). See _split_contributors.
+    """
+    changelog = project_root / "CHANGELOG.md"
+    content = changelog.read_text()
+
+    pattern = rf"## \[{re.escape(version)}\][^\n]*\n(.*?)(?=\n## \[|\Z)"
+    match = re.search(pattern, content, re.DOTALL)
+
+    if not match:
+        return "Release " + version, ""
+
+    return _split_contributors(match.group(1))
+
+
+def extract_unreleased_section(project_root: Path) -> tuple[str, str]:
+    """Extract the [Unreleased] section (dry-run preview source).
+
+    Returns (main_body, acknowledgements). Used before the version bump
+    has rewritten [Unreleased] into a numbered section.
+    """
+    content = (project_root / "CHANGELOG.md").read_text()
+    match = re.search(
+        r"## \[Unreleased\]\s*\n(.*?)(?=^## \[|\Z)",
+        content,
+        re.IGNORECASE | re.DOTALL | re.MULTILINE,
+    )
+    if not match:
+        return "", ""
+    return _split_contributors(match.group(1))
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +527,7 @@ def commit_version_bump(config: ReleaseConfig, new_version: str) -> None:
         ["git", "commit", "-m", commit_msg],
         dry_run=config.dry_run,
         dry_run_msg=f"git commit -m '{commit_msg}'",
+        env={**os.environ, "PRE_COMMIT_ALLOW_NO_CONFIG": "1"},
     )
     if config.dry_run:
         print(f"  [DRY-RUN] Would commit: {commit_msg}")
@@ -469,22 +564,24 @@ def merge_to_master_and_tag(
         print("  ✓ Pushed master with tags")
 
 
-def create_github_release(config: ReleaseConfig, new_version: str) -> None:
-    """Create GitHub release with changelog notes."""
-    print("\n=== GitHub Release ===\n")
+# ---------------------------------------------------------------------------
+# Release notes (claude -p drafted, human approved, persisted for recovery)
+# ---------------------------------------------------------------------------
 
-    tag = f"v{new_version}"
-    body, acknowledgements = extract_changelog_section(
-        config.project_root, new_version
-    )
 
-    ack_block = f"\n\n## Acknowledgements\n\n{acknowledgements}" if acknowledgements else ""
+def notes_file_path(project_root: Path, new_version: str) -> Path:
+    """Path where approved release notes are persisted for crash recovery."""
+    return project_root / f"release_notes_v{new_version}.md"
 
-    notes = f"""## What's New in {tag}
 
-{body}{ack_block}
+def _ack_block(acknowledgements: str) -> str:
+    """Deterministic Acknowledgements block (contributor credits, verbatim)."""
+    return f"\n\n## Acknowledgements\n\n{acknowledgements}" if acknowledgements else ""
 
-## Installation
+
+def _install_and_links_section(new_version: str) -> str:
+    """Deterministic Installation/Links tail shared by all notes formats."""
+    return f"""## Installation
 
 ```bash
 pip install {PACKAGE_NAME}=={new_version}
@@ -496,35 +593,465 @@ pip install {PACKAGE_NAME}=={new_version}
 - [Full Changelog](https://github.com/{GITHUB_REPO}/blob/master/CHANGELOG.md)
 """
 
+
+def build_release_body(generated: str, acknowledgements: str, new_version: str) -> str:
+    """Compose final notes: Claude-generated sections + deterministic tail.
+
+    Acknowledgements are appended verbatim (never LLM-rewritten) so
+    contributor @-mentions and PR links are preserved exactly.
+    """
+    ack = _ack_block(acknowledgements)
+    tail = _install_and_links_section(new_version)
+    return f"{generated.strip()}{ack}\n\n{tail}"
+
+
+def build_raw_release_body(
+    changelog_body: str, acknowledgements: str, new_version: str
+) -> str:
+    """Raw-changelog notes format (fallback path, matches the old style)."""
+    tag = f"v{new_version}"
+    ack = _ack_block(acknowledgements)
+    tail = _install_and_links_section(new_version)
+    return f"""## What's New in {tag}
+
+{changelog_body}{ack}
+
+{tail}"""
+
+
+NOTES_GENERATION_TIMEOUT = 120
+
+# Deny the tools `claude -p` could plausibly reach for (a pure text
+# transform needs none). The prompt also instructs it not to use tools.
+NOTES_DENIED_TOOLS = "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Task,TodoWrite"
+
+# .format() template -- must contain no literal braces (a brace-containing
+# example added later would raise KeyError at release time). No em dashes in
+# the output contract (project writing rule).
+RELEASE_NOTES_PROMPT = """\
+You are writing the GitHub release notes for redmine-mcp-server {tag}, an MCP
+server that gives AI agents tools to manage Redmine projects, issues, wiki
+pages, time tracking, attachments, and more.
+
+Rewrite the changelog section below into product-style release notes for
+users deciding whether to upgrade. Respond directly with the notes only --
+do not use any tools.
+
+Output contract (follow exactly):
+- First line: `TITLE: {tag}: <short headline, at most 8 words>`
+- Then a `## Highlights` section: 2-4 short paragraphs, at most 150 words
+  total. Lead with what is new and why a user would care; keep measurable
+  wins (token savings, speedups, counts).
+- Then a `## Changes` section: condensed one-line bullets grouped under
+  `### Added` / `### Fixed` / `### Changed` / `### Security` (omit empty
+  groups). No internal mechanics: no source file paths, no helper function
+  names, no private symbol names.
+
+Hard rules:
+- Use only facts present in the changelog section. Never invent features,
+  benefits, or numbers.
+- Keep every number exactly as written in the changelog.
+- Never use em dashes. Use a comma, colon, or hyphen instead.
+- Plain markdown only. No H1 headings. Do not add Installation, Links, or
+  Acknowledgements sections (they are appended separately).
+
+Changelog section for {tag}:
+
+{changelog_section}
+"""
+
+
+def _parse_title(output: str, tag: str) -> tuple[str, str]:
+    """Split the TITLE: first-line contract off the draft.
+
+    Malformed or missing title falls back to the bare tag with the full
+    output as body.
+    """
+    lines = output.splitlines()
+    first = lines[0].strip() if lines else ""
+    if first.upper().startswith("TITLE:"):
+        title = first[len("TITLE:") :].strip()
+        if title:
+            body = "\n".join(lines[1:]).strip()
+            return title, body
+    return tag, output
+
+
+def generate_release_notes(
+    new_version: str,
+    changelog_section: str,
+    steering: str | None = None,
+) -> tuple[str, str]:
+    """Draft release notes with `claude -p`. Returns (title, generated_body).
+
+    Raises RuntimeError on any failure (missing CLI, timeout, non-zero
+    exit, empty output) so callers can decide between retry and fallback.
+    """
+    tag = f"v{new_version}"
+    prompt = RELEASE_NOTES_PROMPT.format(tag=tag, changelog_section=changelog_section)
+    if steering:
+        prompt += f"\nAdditional guidance from the maintainer: {steering}\n"
+
+    try:
+        result = subprocess.run(
+            ["claude", "-p", "--disallowedTools", NOTES_DENIED_TOOLS],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=NOTES_GENERATION_TIMEOUT,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("'claude' CLI not found on PATH") from exc
+    except OSError as exc:
+        raise RuntimeError(f"failed to launch 'claude' CLI: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"claude -p timed out after {NOTES_GENERATION_TIMEOUT}s"
+        ) from exc
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"claude -p exited {result.returncode}: {result.stderr.strip()}"
+        )
+    output = result.stdout.strip()
+    if not output:
+        raise RuntimeError("claude -p returned empty output")
+    return _parse_title(output, tag)
+
+
+def write_notes_file(path: Path, title: str, body: str) -> None:
+    """Persist approved notes; first line is an invisible title comment."""
+    path.write_text(f"<!-- title: {title} -->\n{body.strip()}\n")
+
+
+def read_notes_file(path: Path) -> tuple[str | None, str]:
+    """Read persisted notes back. Returns (title or None, body)."""
+    content = path.read_text()
+    match = re.match(r"<!-- title: (.*?) -->\n", content)
+    if match:
+        return match.group(1), content[match.end() :].strip()
+    return None, content.strip()
+
+
+def _edit_notes_in_editor(path: Path) -> None:
+    """Open the notes file in $VISUAL/$EDITOR (fallback vi). Blocking."""
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    subprocess.run([*shlex.split(editor), str(path)], check=False)
+
+
+def approve_release_notes(
+    new_version: str,
+    changelog_body: str,
+    acknowledgements: str,
+    notes_path: Path,
+) -> None:
+    """Generate, approve, and persist release notes to notes_path.
+
+    Interactive (TTY): [y]es / [e]dit in $EDITOR (edit is final) /
+    [r]egenerate with optional steering / [f]allback to raw changelog.
+    Non-TTY: auto-accept the draft. Generation failure: prompt
+    retry/fallback on a TTY, silent fallback otherwise. Never blocks the
+    release on the LLM. Acknowledgements are always appended deterministically.
+    """
+    tag = f"v{new_version}"
+    interactive = sys.stdin.isatty()
+    steering: str | None = None
+
+    while True:
+        print("  Generating release notes draft (claude -p)...")
+        try:
+            title, generated = generate_release_notes(
+                new_version, changelog_body, steering
+            )
+        except RuntimeError as exc:
+            print(f"  ⚠ Notes generation failed: {exc}")
+            if interactive:
+                while True:
+                    choice = (
+                        input("  [r]etry / [f]all back to raw changelog? ")
+                        .strip()
+                        .lower()
+                    )
+                    if choice in ("r", "f"):
+                        break
+                    print("  Please answer r or f.")
+                if choice == "r":
+                    continue
+            print("  Falling back to raw changelog notes.")
+            write_notes_file(
+                notes_path,
+                tag,
+                build_raw_release_body(changelog_body, acknowledgements, new_version),
+            )
+            return
+
+        body = build_release_body(generated, acknowledgements, new_version)
+        print("\n" + "-" * 60)
+        print(f"  Title: {title}")
+        print("-" * 60)
+        print(body)
+        print("-" * 60)
+
+        if not interactive:
+            print("  ⚠ Non-interactive run: auto-accepting generated notes.")
+            write_notes_file(notes_path, title, body)
+            return
+
+        while True:
+            choice = (
+                input("  [y]es publish / [e]dit / [r]egenerate / [f]allback? ")
+                .strip()
+                .lower()
+            )
+            if choice == "y":
+                write_notes_file(notes_path, title, body)
+                return
+            if choice == "e":
+                # Saving in the editor IS the approval -- no re-confirm.
+                write_notes_file(notes_path, title, body)
+                try:
+                    _edit_notes_in_editor(notes_path)
+                except (ValueError, OSError) as exc:
+                    print(f"  ⚠ Could not launch editor: {exc}")
+                    print("  Using the unedited draft as approved.")
+                else:
+                    print(f"  ✓ Using edited notes from {notes_path}")
+                return
+            if choice == "r":
+                steering = input("  Any guidance? (enter to skip) ").strip() or None
+                break
+            if choice == "f":
+                write_notes_file(
+                    notes_path,
+                    tag,
+                    build_raw_release_body(
+                        changelog_body, acknowledgements, new_version
+                    ),
+                )
+                return
+            print("  Please answer y, e, r, or f.")
+
+
+def preview_release_notes(config: ReleaseConfig, new_version: str) -> None:
+    """Dry-run: draft real notes from [Unreleased] and print them."""
+    print("\n=== Release Notes (Preview) ===\n")
+    body, acknowledgements = extract_unreleased_section(config.project_root)
+    try:
+        title, generated = generate_release_notes(new_version, body)
+    except RuntimeError as exc:
+        print(f"  ⚠ Notes generation failed: {exc}")
+        print("  [DRY-RUN] Release would fall back to raw changelog notes.")
+        return
+    final = build_release_body(generated, acknowledgements, new_version)
+    print(f"  [DRY-RUN] Title: {title}")
+    print("  [DRY-RUN] Notes preview:\n")
+    print(final)
+
+
+def create_github_release(config: ReleaseConfig, new_version: str) -> None:
+    """Create GitHub release from approved notes (fallback: raw changelog)."""
+    print("\n=== GitHub Release ===\n")
+
+    tag = f"v{new_version}"
+    notes_path = notes_file_path(config.project_root, new_version)
+    if notes_path.exists():
+        stored_title, notes = read_notes_file(notes_path)
+        title = stored_title or tag
+    else:
+        # Dry-run, or a real run where the notes step was somehow skipped.
+        if not config.dry_run:
+            print("  ⚠ Approved notes file missing; falling back to raw changelog")
+        title = tag
+        body, acknowledgements = extract_changelog_section(
+            config.project_root, new_version
+        )
+        notes = build_raw_release_body(body, acknowledgements, new_version)
+
     if config.dry_run:
         print(f"  [DRY-RUN] Would create GitHub release: {tag}")
-        print("  [DRY-RUN] Release notes preview:")
-        for line in notes.split("\n")[:10]:
-            print(f"    {line}")
-        print("    ...")
+        if notes_path.exists():
+            print(f"  [DRY-RUN] Title: {title}")
+            print("  [DRY-RUN] Release notes preview:")
+            for line in notes.split("\n")[:10]:
+                print(f"    {line}")
+            print("    ...")
+        else:
+            print(
+                "  [DRY-RUN] Title and notes would come from the approved "
+                "notes file (see the Release Notes preview above)."
+            )
     else:
-        run_command(
-            ["gh", "release", "create", tag, "--title", tag, "--notes", notes],
+        result = run_command(
+            ["gh", "release", "create", tag, "--title", title, "--notes", notes],
+            check=False,
         )
-        print(f"  ✓ Created GitHub release: {tag}")
+        if result.returncode != 0:
+            print("  ✗ gh release create failed:")
+            print(f"    {result.stderr.strip()}")
+            print_recovery_instructions(
+                new_version,
+                f"release/v{new_version}",
+                config.hotfix,
+                config.project_root,
+            )
+            sys.exit(1)
+        print(f"  ✓ Created GitHub release: {title}")
 
 
-def wait_for_pypi(new_version: str, max_wait: int = 300) -> bool:
-    """Wait for package to be available on PyPI."""
+def wait_for_publish_workflow(new_version: str, max_wait: int = 900) -> bool:
+    """Poll the publish-pypi.yml run triggered by the tag push.
+
+    Returns True only if the workflow run on the tag's SHA completes with
+    conclusion=success. Returns False on any other terminal conclusion or
+    on timeout. Prints the run URL so a failure is easy to investigate.
+    """
+    tag = f"v{new_version}"
+    print("\n=== Publish Workflow ===\n")
+
+    # CRITICAL: annotated tags (git tag -a) have their own object SHA;
+    # GitHub Actions reports the commit SHA in headSha. Dereference with
+    # ^{commit} so the match works. Comparing the raw tag SHA never
+    # matches and the poller spins forever.
+    sha_result = run_command(["git", "rev-parse", f"{tag}^{{commit}}"])
+    tag_sha = sha_result.stdout.strip()
+    print(f"  Watching publish-pypi.yml for tag {tag} ({tag_sha[:7]})...")
+
+    start_time = time.time()
+    check_interval = 15
+    last_status: str | None = None
+
+    while time.time() - start_time < max_wait:
+        elapsed = int(time.time() - start_time)
+        result = run_command(
+            [
+                "gh",
+                "run",
+                "list",
+                "--workflow=publish-pypi.yml",
+                "--limit",
+                "10",
+                "--json",
+                "databaseId,status,conclusion,headSha,url",
+            ],
+            check=False,
+        )
+        if result.returncode != 0:
+            print(f"  ⚠ gh run list failed: {result.stderr.strip()}; retrying...")
+            time.sleep(check_interval)
+            continue
+
+        try:
+            runs = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            time.sleep(check_interval)
+            continue
+
+        match = next((r for r in runs if r.get("headSha") == tag_sha), None)
+        if match is None:
+            print(f"  Run not yet registered... ({elapsed}s elapsed)")
+            time.sleep(10)
+            continue
+
+        status = match.get("status")
+        conclusion = match.get("conclusion")
+        url = match.get("url", "")
+        run_id = match.get("databaseId")
+
+        if status == "completed":
+            if conclusion == "success":
+                print(f"  ✓ publish-pypi run succeeded ({url})")
+                return True
+            print(f"  ✗ publish-pypi run finished with conclusion={conclusion}")
+            print(f"    URL: {url}")
+            print(f"    Logs: gh run view {run_id} --log-failed")
+            return False
+
+        if status != last_status:
+            print(f"  Run {run_id} status={status}... ({elapsed}s elapsed)")
+            last_status = status
+        else:
+            print(f"  Still {status}... ({elapsed}s elapsed)")
+        time.sleep(check_interval)
+
+    print(f"  ⚠ Timeout after {max_wait}s waiting for publish-pypi workflow")
+    return False
+
+
+def print_recovery_instructions(
+    new_version: str, release_branch: str, hotfix: bool, project_root: Path
+) -> None:
+    """Print actionable recovery steps when publish fails after tagging."""
+    tag = f"v{new_version}"
+    branch_kind = "hotfix" if hotfix else "release"
+    print("\n" + "=" * 60)
+    print(f"  RELEASE {tag} INCOMPLETE")
+    print("=" * 60)
+    print()
+    print("  Current state:")
+    print(f"    - Tag {tag} is pushed to origin")
+    print(f"    - master has the version-bump commit for {tag}")
+    print("    - GitHub release was NOT created")
+    print("    - MCP Registry was NOT updated")
+    print(
+        f"    - develop is unchanged; {branch_kind} branch "
+        f"{release_branch} still exists locally"
+    )
+    print()
+    print("  Investigate:")
+    print("    gh run list --workflow=publish-pypi.yml --limit 5")
+    print("    gh run view <run-id> --log-failed")
+    print()
+    print("  After diagnosing, choose one:")
+    print("    A) Fix the cause on develop, then rerun the existing tag's workflow:")
+    print("         gh run rerun <run-id>")
+    print("       On success, finish the remaining steps manually:")
+    notes_path = notes_file_path(project_root, new_version)
+    if notes_path.exists():
+        stored_title, _ = read_notes_file(notes_path)
+        title = stored_title or tag
+        print(f"         gh release create {tag} --title {shlex.quote(title)} \\")
+        print(f'           --notes-file "{notes_path}"')
+        print(f"         (your approved notes are saved at {notes_path})")
+    else:
+        print(f"         gh release create {tag} --title {tag} --notes-file <notes.md>")
+    print("         mcp-publisher publish")
+    print(f"         git checkout develop && git merge {release_branch} && git push")
+    print(f"         git branch -d {release_branch}")
+    print("    B) Burn this version and ship the next patch from develop")
+    print("       (requires deleting tag + reverting the master commit -- destructive,")
+    print(f"        only do this if nobody has pulled {tag}).")
+    print("=" * 60)
+
+
+def wait_for_pypi(new_version: str, max_wait: int = 600) -> bool:
+    """Wait for package to be available on PyPI.
+
+    Checks the JSON API endpoint that the MCP Registry actually validates
+    against. ``pip index versions`` can return false positives because the
+    simple index updates before the JSON API does, and MCP publish would
+    then fail with a not-found error.
+    """
+    import urllib.error
+    import urllib.request
+
     print("\n=== Waiting for PyPI ===\n")
 
+    url = f"https://pypi.org/pypi/{PACKAGE_NAME}/{new_version}/json"
     start_time = time.time()
     check_interval = 15
 
     while time.time() - start_time < max_wait:
-        result = run_command(
-            ["pip", "index", "versions", PACKAGE_NAME],
-            check=False,
-            capture_output=True,
-        )
-        if new_version in result.stdout:
-            print(f"  ✓ Version {new_version} is available on PyPI")
-            return True
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                if resp.status == 200:
+                    print(f"  ✓ Version {new_version} is available on PyPI")
+                    return True
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                print(f"  Unexpected status {e.code}, retrying...")
+        except urllib.error.URLError as e:
+            print(f"  Network error: {e.reason}, retrying...")
 
         elapsed = int(time.time() - start_time)
         print(f"  Waiting for PyPI... ({elapsed}s elapsed)")
@@ -535,7 +1062,13 @@ def wait_for_pypi(new_version: str, max_wait: int = 300) -> bool:
 
 
 def publish_mcp_registry(config: ReleaseConfig) -> None:
-    """Publish to MCP Registry."""
+    """Publish to MCP Registry.
+
+    Authenticates immediately before publishing. The Registry JWT is
+    short-lived, so logging in earlier (e.g. at preflight) leaves an
+    expired token by the time the publish-workflow and PyPI waits finish --
+    the failure mode that leaves a version off the registry.
+    """
     print("\n=== MCP Registry ===\n")
 
     result = run_command(["which", "mcp-publisher"], check=False)
@@ -545,18 +1078,42 @@ def publish_mcp_registry(config: ReleaseConfig) -> None:
         return
 
     if config.dry_run:
-        print("  [DRY-RUN] Would run: mcp-publisher publish")
-    else:
-        result = run_command(
-            ["mcp-publisher", "publish"],
+        print("  [DRY-RUN] Would authenticate, then run: mcp-publisher publish")
+        return
+
+    # Mint a fresh token right before publishing (GitHub device flow).
+    print("  Authenticating mcp-publisher (fresh token)...")
+    try:
+        login_result = subprocess.run(
+            ["mcp-publisher", "login", "github"],
             check=False,
-            capture_output=True,
+            timeout=300,
         )
-        if result.returncode == 0:
-            print("  ✓ Published to MCP Registry")
-        else:
-            print(f"  ⚠ MCP Registry publish failed: {result.stderr}")
-            print("  You may need to run 'mcp-publisher login github' first")
+    except subprocess.TimeoutExpired:
+        print("  ⚠ mcp-publisher login timed out. Skipping MCP Registry publish.")
+        print(
+            "  Run 'mcp-publisher login github' then "
+            "'mcp-publisher publish' manually."
+        )
+        return
+    if login_result.returncode != 0:
+        print("  ⚠ mcp-publisher login failed. Skipping MCP Registry publish.")
+        print(
+            "  Run 'mcp-publisher login github' then "
+            "'mcp-publisher publish' manually."
+        )
+        return
+
+    result = run_command(
+        ["mcp-publisher", "publish"],
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        print("  ✓ Published to MCP Registry")
+    else:
+        print(f"  ⚠ MCP Registry publish failed: {result.stderr}")
+        print("  You may need to run 'mcp-publisher login github' first")
 
 
 def merge_back_to_develop(config: ReleaseConfig, release_branch: str) -> None:
@@ -573,7 +1130,19 @@ def merge_back_to_develop(config: ReleaseConfig, release_branch: str) -> None:
         run_command(["git", "pull", "origin", "develop"])
         print("  ✓ Checked out develop")
 
-        run_command(["git", "merge", release_branch, "--no-edit"])
+        result = run_command(
+            ["git", "merge", release_branch, "--no-edit"],
+            check=False,
+        )
+        if result.returncode != 0:
+            print(f"\n  ✗ Merge conflict when merging {release_branch} into develop.")
+            print("\n  Resolve conflicts manually:")
+            print("    git status                        # see conflicting files")
+            print("    # edit files to resolve")
+            print("    git add <resolved-files>")
+            print("    git commit                        # complete the merge")
+            print(f"    git branch -d {release_branch}   # cleanup branch when done")
+            sys.exit(1)
         print(f"  ✓ Merged {release_branch}")
 
         run_command(["git", "push", "origin", "develop"])
@@ -581,10 +1150,26 @@ def merge_back_to_develop(config: ReleaseConfig, release_branch: str) -> None:
 
         # Delete release branch locally and remotely
         run_command(["git", "branch", "-d", release_branch])
-        run_command(
-            ["git", "push", "origin", "--delete", release_branch], check=False
-        )
+        run_command(["git", "push", "origin", "--delete", release_branch], check=False)
         print(f"  ✓ Deleted branch: {release_branch}")
+
+
+def _check_hotfix_version_sanity(branch: str, new_version: str) -> None:
+    """Warn if hotfix branch name version doesn't match calculated bump."""
+    # Extract version from branch name e.g. hotfix/v1.2.1 -> 1.2.1
+    parts = branch.split("/")
+    if len(parts) < 2:
+        return
+    branch_version = parts[-1].lstrip("v")
+    if branch_version != new_version:
+        print(
+            f"  ⚠ Warning: branch name suggests v{branch_version} "
+            f"but version bump produces v{new_version}."
+        )
+        print(
+            "    Verify pyproject.toml is correct. "
+            "Use --dry-run to inspect before proceeding."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -611,23 +1196,39 @@ Gitflow:
     parser.add_argument(
         "bump_type",
         choices=["patch", "minor", "major"],
-        help="Version bump type",
+        nargs="?",
+        default=None,
+        help="Version bump type (required unless --hotfix is set)",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Preview changes without executing",
     )
+    parser.add_argument(
+        "--hotfix",
+        action="store_true",
+        help="Finish the current hotfix/* branch (patch bump implied)",
+    )
 
     args = parser.parse_args()
+
+    # Validate: bump_type required unless --hotfix
+    if args.hotfix:
+        bump_type = "patch"
+    elif args.bump_type is None:
+        parser.error("bump_type is required unless --hotfix is set")
+    else:
+        bump_type = args.bump_type
 
     # Determine project root (parent of scripts directory)
     project_root = Path(__file__).parent.parent.resolve()
 
     config = ReleaseConfig(
-        bump_type=args.bump_type,
+        bump_type=bump_type,
         dry_run=args.dry_run,
         project_root=project_root,
+        hotfix=args.hotfix,
     )
 
     print("=" * 60)
@@ -638,19 +1239,28 @@ Gitflow:
         print("\n  ⚠️  DRY-RUN MODE - No changes will be made\n")
 
     # Step 1: Pre-flight checks
-    preflight_checks()
+    preflight_checks(config)
 
     # Step 2: Calculate new version
     current_version = get_current_version(config.project_root)
     new_version = calculate_new_version(current_version, config.bump_type)
 
-    # Step 3: Create release branch
-    release_branch = create_release_branch(new_version, config.dry_run)
+    # Step 3: Create release branch (skipped in hotfix mode)
+    if config.hotfix:
+        result = run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+        release_branch = result.stdout.strip()
+        print(f"\n=== Hotfix Branch: {release_branch} ===\n")
+    else:
+        release_branch = create_release_branch(new_version, config.dry_run)
 
     # Step 4: Bump version in files
     print("\n=== Version Bump ===\n")
     print(f"Version: {current_version} -> {new_version}")
     print()
+
+    # Hotfix sanity check: warn if branch name doesn't match calculated version
+    if config.hotfix:
+        _check_hotfix_version_sanity(release_branch, new_version)
     update_pyproject_toml(config.project_root, new_version, config.dry_run)
     update_server_json(config.project_root, new_version, config.dry_run)
     update_changelog(config.project_root, new_version, config.dry_run)
@@ -659,27 +1269,62 @@ Gitflow:
     # Step 5: Commit version bump on release branch
     commit_version_bump(config, new_version)
 
-    # Step 6: Merge to master and tag
+    # Step 5b: Draft + approve release notes NOW, so the long unattended
+    # waits (publish workflow, PyPI) happen after the human interaction.
+    notes_path = notes_file_path(config.project_root, new_version)
+    if config.dry_run:
+        preview_release_notes(config, new_version)
+    else:
+        print("\n=== Release Notes ===\n")
+        body, acknowledgements = extract_changelog_section(
+            config.project_root, new_version
+        )
+        approve_release_notes(new_version, body, acknowledgements, notes_path)
+        print(f"  ✓ Approved notes saved to {notes_path}")
+
+    # Step 6: Merge to master and tag (this push triggers publish-pypi.yml)
     merge_to_master_and_tag(config, new_version, release_branch)
 
-    # Step 7: Create GitHub release
-    create_github_release(config, new_version)
-
-    # Step 8: Wait for PyPI and publish to MCP Registry
+    # Step 7: Watch the publish-pypi workflow, then wait for PyPI to expose
+    # the version via its JSON API. The GitHub release is created AFTER both
+    # confirm -- otherwise the release notes would ship a `pip install` line
+    # that does not yet (or may never) work.
     if not config.dry_run:
-        if wait_for_pypi(new_version):
-            publish_mcp_registry(config)
-        else:
-            print("\n  ⚠ Skipping MCP Registry (PyPI not ready)")
-            print("  Run manually later: mcp-publisher publish")
+        if not wait_for_publish_workflow(new_version):
+            print_recovery_instructions(
+                new_version, release_branch, config.hotfix, config.project_root
+            )
+            sys.exit(1)
+
+        if not wait_for_pypi(new_version):
+            print_recovery_instructions(
+                new_version, release_branch, config.hotfix, config.project_root
+            )
+            sys.exit(1)
     else:
+        print("\n=== Publish Workflow ===\n")
+        print("  [DRY-RUN] Would poll publish-pypi.yml run to completion")
         print("\n=== Waiting for PyPI ===\n")
         print("  [DRY-RUN] Would wait for PyPI availability")
-        print("\n=== MCP Registry ===\n")
-        print("  [DRY-RUN] Would run: mcp-publisher publish")
 
-    # Step 9: Merge back to develop and cleanup
+    # Step 8: Create GitHub release -- now safe to advertise the PyPI install
+    create_github_release(config, new_version)
+
+    # Step 9: Publish to MCP Registry
+    if not config.dry_run:
+        publish_mcp_registry(config)
+    else:
+        print("\n=== MCP Registry ===\n")
+        print("  [DRY-RUN] Would authenticate, then run: mcp-publisher publish")
+
+    # Step 10: Merge back to develop and cleanup
     merge_back_to_develop(config, release_branch)
+
+    # Release fully succeeded; the persisted notes drafts (including any
+    # orphans from previously burned versions) are no longer needed.
+    if not config.dry_run:
+        for stale_notes in config.project_root.glob("release_notes_v*.md"):
+            stale_notes.unlink()
 
     # Done!
     print("\n" + "=" * 60)
@@ -693,9 +1338,7 @@ Gitflow:
         print(f"    - PyPI: {pypi_url}")
         gh_url = f"https://github.com/{GITHUB_REPO}/releases/tag/v{new_version}"
         print(f"    - GitHub: {gh_url}")
-        mcp_url = (
-            "https://registry.modelcontextprotocol.io/v0/servers?search=redmine"
-        )
+        mcp_url = "https://registry.modelcontextprotocol.io/v0/servers?search=redmine"
         print(f"    - MCP Registry: {mcp_url}")
     print("=" * 60)
 

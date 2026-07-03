@@ -13,7 +13,7 @@ import sys
 # Add the src directory to the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from redmine_mcp_server.redmine_handler import search_redmine_issues  # noqa: E402
+from redmine_mcp_server.tools.issues import search_redmine_issues  # noqa: E402
 
 
 class TestSearchFieldSelection:
@@ -22,7 +22,7 @@ class TestSearchFieldSelection:
     @pytest.fixture
     def mock_redmine(self):
         """Create a mock Redmine client."""
-        with patch("redmine_mcp_server.redmine_handler.redmine") as mock:
+        with patch("redmine_mcp_server._client.redmine") as mock:
             yield mock
 
     def create_mock_issue(self, issue_id=1):
@@ -264,15 +264,12 @@ class TestSearchFieldSelection:
         assert len(result[0]) == 10
 
     @pytest.mark.asyncio
-    async def test_fields_with_mcp_parameter_unwrapping(self, mock_redmine):
-        """Test field selection with MCP parameter unwrapping."""
+    async def test_fields_with_explicit_params(self, mock_redmine):
+        """Test field selection with explicit parameters."""
         mock_issue = self.create_mock_issue()
         mock_redmine.issue.search.return_value = [mock_issue]
 
-        # Simulate MCP wrapping parameters
-        result = await search_redmine_issues(
-            "bug", options={"fields": ["id", "subject"], "limit": 10}
-        )
+        result = await search_redmine_issues("bug", fields=["id", "subject"], limit=10)
 
         assert len(result[0]) == 2
         assert "id" in result[0]

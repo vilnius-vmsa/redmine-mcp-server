@@ -67,6 +67,114 @@ Thank you for your interest in contributing to the Redmine MCP Server! This guid
    uv run python -m redmine_mcp_server.main
    ```
 
+## Where things live
+
+After v2.0, the codebase is organized by resource:
+
+### Tool implementations
+
+Tools live under `src/redmine_mcp_server/tools/`, one file per Redmine resource:
+
+| File | Tools |
+|---|---|
+| `tools/projects.py` | Project listing, versions, members, roles, modules (9 tools) |
+| `tools/issues.py` | Issues, search, copy, delete, relations, watchers, notes, categories, subtasks, private notes (13 tools) |
+| `tools/time_tracking.py` | Time entries, activities, bulk import (4 tools) |
+| `tools/wiki.py` | Wiki page CRUD + rename (1 tool, 6 actions) |
+| `tools/files.py` | File upload/download/delete + attachment URLs (4 tools, plus `cleanup_attachment_files` admin-gated) |
+| `tools/enumeration.py` | Trackers, statuses, priorities, users, queries (6 tools) |
+| `tools/search.py` | Global search across resources (1 tool) |
+| `tools/checklists.py` | RedmineUP Checklists plugin (2 tools, gated) |
+| `tools/gantt.py` | Gantt chart composite read tool (1 tool) |
+| `tools/products.py` | RedmineUP Products plugin (1 tool, gated) |
+| `tools/contacts.py` | RedmineUP CRM plugin (1 tool, gated) |
+| `tools/documents.py` | DMSF plugin documents (1 tool with list/get/create/update actions, gated) |
+| `tools/meta.py` | Server introspection: `get_mcp_server_info` (1 tool, always available) |
+
+Total: **45 MCP tools** unconditionally registered, **plus 1 admin-gated** (`cleanup_attachment_files`, enabled by `REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`) for a maximum of 46.
+
+Each `tools/<resource>.py` also owns its resource-specific serializers (`_X_to_dict` helpers).
+
+### Shared helpers
+
+Cross-cutting utilities live as flat private modules:
+
+| Module | Responsibility |
+|---|---|
+| `_client.py` | Redmine connection (legacy, `oauth`, and `oauth-proxy`), module-level config, logger |
+| `_errors.py` | `_handle_redmine_error`, `_scrub_error_message`, `_READ_ONLY_ERROR` |
+| `_validation.py` | Input validators (`_is_positive_int`, `_is_valid_project_id`, `_validate_hours`) |
+| `_serialization.py` | `wrap_insecure_content`, `_safe_isoformat`, `_iter_capped`, `_named_ref`, `_coerce_json_safe` |
+| `_env.py` | Environment accessors: read-only / plugin flags (`_is_read_only_mode`, `_is_*_enabled`), secret resolution with Docker/Kubernetes `*_FILE` support (`get_secret`, `get_required`, `get_required_secret`), `require_introspection_credentials`, `get_allowed_client_redirect_uris` (oauth-proxy redirect-URI allowlist), `get_health_introspection_ttl_seconds` |
+| `_custom_fields.py` | Custom-field parsing, autofill, and update coercion |
+| `_ssrf.py` | SSRF protection for `upload_file`'s `source_url` |
+| `_cleanup.py` | Background cleanup task |
+| `_http_routes.py` | Starlette routes (`/health` with a Doorkeeper introspection probe in `oauth` / `oauth-proxy` modes and a Redmine credential probe in legacy mode, `/files/{id}`, `/cleanup/status`) |
+| `_decorators.py` | `@action_dispatch` decorator + `ActionMode` enum |
+| `_auth.py` | `RedmineAuthProvider` (a `RemoteAuthProvider` subclass) and its `build_remote_auth()` factory: composes `IntrospectionTokenVerifier` (RFC 7662) and adds the RFC 8414 AS-metadata mirror plus the RFC 7009 `/revoke` route. Used by `oauth` mode. |
+| `_oauth_proxy.py` | `build_oauth_proxy()` factory: a FastMCP `OAuthProxy` backed by `IntrospectionTokenVerifier`, proxying `/authorize`, `/token`, and `/revoke` to Doorkeeper with external consent and a loopback-default redirect-URI allowlist. Used by `oauth-proxy` mode. |
+| `_mount.py` | Public base-URL helpers (`mcp_base_url`, `mcp_path_for_http_app`, `mcp_mount_prefix`) for serving the authenticated app behind `REDMINE_MCP_BASE_URL`. |
+| `_tool_error_middleware.py` | FastMCP middleware that surfaces tool-validation errors with a clean payload. |
+| `oauth_scopes.py` | `READ_SCOPES` / `WRITE_SCOPES` inventory + `advertised_scopes()` used by both the protected-resource and AS-metadata discovery documents. |
+
+### Adding a new `manage_X` tool
+
+The 9 `manage_X` tools (plus `manage_redmine_version`) follow a consistent pattern via the `@action_dispatch` decorator. Example:
+
+```python
+from .._decorators import ActionMode, action_dispatch
+
+# Per-action handlers (private async functions in the same file)
+async def _list_widgets_action(project_id=None, **_):
+    # validation, fetch, return
+    ...
+
+async def _create_widget_action(project_id=None, name=None, **_):
+    # validation, create, return
+    ...
+
+@mcp.tool()
+@action_dispatch({
+    "list": ActionMode.READ,
+    "create": ActionMode.WRITE,
+})
+async def manage_widget(action: str, project_id=None, name=None):
+    """Docstring with full param/return shape."""
+    return {
+        "list": _list_widgets_action,
+        "create": _create_widget_action,
+    }
+```
+
+The decorator handles:
+- Action validation (returns `{"error": "Invalid action ..."}` on bad input)
+- Read-only guard for `WRITE` actions (returns `_READ_ONLY_ERROR` if env enables read-only mode)
+- `_ensure_cleanup_started()` for `WRITE` actions
+- Routing to the per-action handler
+
+Per-action handlers stay responsible for: their own parameter validation, calling the Redmine API, and wrapping exceptions via `_handle_redmine_error`.
+
+**Important:** keep the public `manage_X` tool's full explicit parameter list (FastMCP rejects `**kwargs` in tool signatures). Only the body changes to return the handler-map dict.
+
+For plugin-gated tools (`manage_product`, `manage_contact`), wrap the dispatcher in a feature-flag check:
+
+```python
+@mcp.tool()
+async def manage_widget(action: str, project_id=None, name=None):
+    if not _is_widgets_enabled():
+        return dict(_WIDGETS_DISABLED_ERROR)
+    return await _manage_widget_dispatch(
+        action,
+        project_id=project_id,
+        name=name,
+    )
+
+
+@action_dispatch({...})
+async def _manage_widget_dispatch(action, **kwargs):
+    return {...}
+```
+
 ## Development Workflow
 
 ### 1. Create a Branch
@@ -109,6 +217,45 @@ python tests/run_tests.py --integration
 # With coverage report
 python tests/run_tests.py --coverage
 ```
+
+**Live OAuth Integration Tests (v2.1+):**
+
+The unit suite mocks Doorkeeper at the httpx transport boundary. To exercise real Doorkeeper RFC 7662 introspection against a sandbox Redmine:
+
+1. Register an MCP introspection client in the sandbox per `docs/oauth-setup.md` Step 2.
+2. Mint a valid bearer for any user-flow OAuth app in the same sandbox.
+3. Add the four env vars to your `.env` file:
+
+   ```bash
+   REDMINE_URL=https://sandbox-redmine.example.com
+   REDMINE_INTROSPECT_CLIENT_ID=...
+   REDMINE_INTROSPECT_CLIENT_SECRET=...
+   REDMINE_OAUTH_TEST_TOKEN=...
+   ```
+
+   The OAuth integration test module calls `load_dotenv()` at import time, so vars in `.env` are picked up automatically — no need to re-export on the command line.
+
+4. Run the full integration suite:
+
+   ```bash
+   python tests/run_tests.py --integration
+   ```
+
+   …or run just the OAuth subset (needs direct pytest because `run_tests.py` does not forward `-k`):
+
+   ```bash
+   python -m pytest tests/test_oauth_integration.py -v -m integration
+   ```
+
+If any required env var is missing, the OAuth tests skip with a clear "Live OAuth integration not configured" message — safe to leave in CI.
+
+The destructive `test_revoked_token_rejected` test invalidates the test bearer and is skipped by default. To enable (and lose the bearer):
+
+```bash
+RUN_DESTRUCTIVE_TESTS=1 python tests/run_tests.py --integration
+```
+
+Re-mint the test bearer through the sandbox's OAuth user-flow before re-running.
 
 **Writing Tests:**
 
@@ -426,50 +573,78 @@ See [RELEASE_SOP.md](../RELEASE_SOP.md) for complete release procedures.
 ```
 redmine-mcp-server/
 ├── src/redmine_mcp_server/
-│   ├── main.py              # FastMCP application entry point + OAuth discovery routes
-│   ├── redmine_handler.py   # MCP tools and Redmine integration
-│   ├── oauth_middleware.py  # OAuth2 Bearer token validation middleware
-│   └── file_manager.py      # Attachment file management and cleanup
+│   ├── main.py              # Entry point; build_authenticated_app() mounts the MCP app + discovery routes (oauth / oauth-proxy)
+│   ├── server.py            # Owns the shared `mcp = FastMCP(...)` instance; _select_auth_provider() picks the auth provider
+│   ├── tools/               # 13 per-resource tool modules (45 MCP tools + 1 admin-gated)
+│   ├── _auth.py             # RedmineAuthProvider (introspection + AS-metadata + revoke), oauth mode
+│   ├── _oauth_proxy.py      # OAuthProxy factory (DCR + authorize/token/revoke proxy), oauth-proxy mode
+│   ├── _mount.py            # Public base-URL / MCP-path / mount-prefix helpers
+│   ├── _client.py           # Redmine connection (legacy singleton; per-request bearer for oauth / oauth-proxy)
+│   ├── _errors.py           # Exception → user-friendly dict
+│   ├── _validation.py       # Input validators
+│   ├── _serialization.py    # Serializer helpers + `wrap_insecure_content`
+│   ├── _env.py              # Environment-flag accessors
+│   ├── _custom_fields.py    # Custom-field parsing/coercion
+│   ├── _ssrf.py             # SSRF protection for upload_file source_url
+│   ├── _cleanup.py          # Background attachment cleanup task
+│   ├── _http_routes.py      # Starlette routes (/health w/ introspection + legacy redmine probe, /files, /cleanup/status)
+│   ├── _decorators.py       # `@action_dispatch` decorator + `ActionMode` enum
+│   ├── _tool_error_middleware.py  # FastMCP middleware that normalizes tool validation errors
+│   ├── oauth_scopes.py      # READ_SCOPES / WRITE_SCOPES inventory + advertised_scopes()
+│   └── file_manager.py      # Attachment file storage manager
 ├── tests/                   # Comprehensive test suite
 ├── docs/                    # Documentation
 │   ├── tool-reference.md    # Tool usage documentation
 │   ├── troubleshooting.md   # Troubleshooting guide
+│   ├── oauth-setup.md       # OAuth2 multi-tenant setup walkthrough
 │   └── contributing.md      # This file
 ├── .env.example            # Environment configuration template
 ├── Dockerfile              # Container configuration
 ├── docker-compose.yml      # Multi-container setup
-├── deploy.sh              # Deployment automation
 └── pyproject.toml         # Project configuration
 ```
 
 ### Core Components
 
-- **main.py**: FastMCP application entry point; registers OAuth middleware when `REDMINE_AUTH_MODE=oauth` and serves RFC 8707/8414 discovery endpoints
-- **redmine_handler.py**: MCP tools implementation using python-redmine; `_get_redmine_client()` selects auth per request (OAuth token → API key → username/password)
-- **oauth_middleware.py**: Starlette middleware that validates Bearer tokens against Redmine before forwarding MCP requests; uses `ContextVar` for per-request token storage
-- **file_manager.py**: Attachment file management and cleanup utilities
+- **`main.py`**: Entry point. In an authenticated mode (`oauth` or `oauth-proxy`), `build_authenticated_app()` mounts the FastMCP app under the `REDMINE_MCP_BASE_URL` path prefix and adds the provider's `get_well_known_routes()` (discovery) plus `/health`, `/files`, `/cleanup/status`; in legacy mode it returns `mcp.http_app(stateless_http=True)`. Tool registration is triggered via `from . import tools`. No Starlette middleware is added; auth lives inside FastMCP via the `auth=` constructor parameter.
+- **`server.py`**: Owns the shared `mcp = FastMCP("redmine_mcp_tools", auth=...)` instance imported by every tool module. `_select_auth_provider(auth_mode)` returns `build_remote_auth()` (a `RedmineAuthProvider`) for `oauth`, `build_oauth_proxy()` (a FastMCP `OAuthProxy`) for `oauth-proxy`, and `None` for legacy.
+- **`_auth.py`** (`oauth` mode): `build_remote_auth()` returns a `RedmineAuthProvider`, a `RemoteAuthProvider` subclass that composes `IntrospectionTokenVerifier` (RFC 7662 against Doorkeeper's `/oauth/introspect`) and additionally serves the RFC 8414 AS-metadata mirror and the RFC 7009 `/revoke` route. Reads `REDMINE_INTROSPECT_CLIENT_ID` / `_SECRET` via `_env.require_introspection_credentials()` (fail-fast on startup).
+- **`_oauth_proxy.py`** (`oauth-proxy` mode): `build_oauth_proxy()` returns a FastMCP `OAuthProxy` that makes the MCP server the OAuth authorization server for clients (DCR + `/authorize` / `/token` / `/register`) and proxies upstream to Redmine/Doorkeeper, validating tokens with the same `IntrospectionTokenVerifier`. Keeps consent external (`require_authorization_consent="external"`), requires `REDMINE_MCP_JWT_SIGNING_KEY`, and restricts client redirect URIs to loopback by default (`get_allowed_client_redirect_uris()`).
+- **`tools/`**: Per-resource tool modules. Each file owns its `@mcp.tool()` definitions and resource-specific serializers (`_X_to_dict` helpers). See [Where things live](#where-things-live) earlier in this guide for the full table.
+- **Flat `_X.py` modules**: Cross-cutting helpers (`_client`, `_errors`, `_validation`, `_serialization`, `_env`, `_custom_fields`, `_ssrf`, `_cleanup`, `_http_routes`, `_decorators`, `_auth`, `_oauth_proxy`, `_mount`, `_tool_error_middleware`). See [Where things live](#where-things-live) for responsibilities.
+- **`_client.py`**: In `oauth` and `oauth-proxy` modes, builds a per-request `Redmine(...)` from the bearer returned by `fastmcp.server.dependencies.get_access_token()`. In legacy mode, caches a singleton built from `REDMINE_API_KEY` or `REDMINE_USERNAME`/`REDMINE_PASSWORD`. (Pre-v2.1: validated tokens via `GET /users/current.json` through a custom `ContextVar`-based middleware; both removed in the v2.1 native-auth migration.)
+- **`oauth_scopes.py`**: Single source of truth for `scopes_supported` in the protected-resource and AS-metadata discovery documents. Filters `WRITE_SCOPES` out when `REDMINE_MCP_READ_ONLY=true`.
+- **`file_manager.py`**: Attachment file storage manager (UUID-based files + metadata.json with expiry).
+
+This layout was introduced in v2.0 (replacing the previous monolithic `redmine_handler.py`), updated in v2.1 (auth moved from `oauth_middleware.py` to native FastMCP `auth=` via `_auth.py`), and extended in v2.3 with the `oauth-proxy` mode (`_oauth_proxy.py`, `_mount.py`, and the `RemoteAuthProvider` → `RedmineAuthProvider` refactor).
 
 ### Key Technologies
 
-- **FastMCP**: MCP protocol implementation with streamable HTTP transport
+- **FastMCP**: MCP protocol implementation with HTTP transport
 - **python-redmine**: Official Redmine Python library
-- **FastAPI**: HTTP server framework
+- **Starlette**: ASGI HTTP framework
 - **uvicorn**: ASGI server
 
 ### Design Patterns
 
 - Async/await for non-blocking operations
 - Error handling with user-friendly error dictionaries
-- Helper functions for data conversion (_issue_to_dict, etc.)
-- Environment-based configuration with .env files
+- Per-resource serializer helpers (`_issue_to_dict`, `_project_to_dict`, etc.)
+- `@action_dispatch` decorator for `manage_X` tools (action validation, read-only guard, cleanup hook)
+- Environment-based configuration with `.env` files
 
 ## Adding New Tools
 
 To add a new MCP tool to the server:
 
-1. **Define the tool** in `src/redmine_mcp_server/redmine_handler.py`:
+1. **Pick the right `tools/<resource>.py` file** (or create a new one if the resource doesn't fit any existing module). See [Where things live](#where-things-live) for the file/resource mapping.
+
+2. **Define the tool** in that file:
 
    ```python
+   from ..server import mcp
+   from .._errors import _handle_redmine_error
+
    @mcp.tool()
    async def your_new_tool(param: str) -> Dict[str, Any]:
        """
@@ -486,17 +661,19 @@ To add a new MCP tool to the server:
            result = perform_operation(param)
            return {"success": True, "data": result}
        except Exception as e:
-           return {"error": f"Failed to execute tool: {str(e)}"}
+           return _handle_redmine_error(e, "your_new_tool")
    ```
 
-2. **The tool is automatically registered** - FastMCP discovers tools decorated with `@mcp.tool()`
+3. **The tool is automatically registered** — FastMCP discovers tools decorated with `@mcp.tool()` once the module is imported. New `tools/<resource>.py` files must be imported from `tools/__init__.py`.
 
-3. **Test your tool**:
-   - Add unit tests in `tests/test_redmine_handler.py`
+4. **For `manage_X`-style tools** (multi-action CRUD), use the `@action_dispatch` decorator. See [Adding a new `manage_X` tool](#adding-a-new-manage_x-tool) earlier in this guide.
+
+5. **Test your tool**:
+   - Add unit tests in `tests/test_<resource>_tools.py` (or the matching existing file)
    - Add integration tests if it interacts with Redmine
    - Run tests: `python tests/run_tests.py --all`
 
-4. **Document your tool**:
+6. **Document your tool**:
    - Add entry to `docs/tool-reference.md`
    - Include parameters, returns, and examples
    - Update README tool count if needed

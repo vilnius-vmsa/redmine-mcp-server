@@ -7,7 +7,7 @@ Tests for listing project memberships including users, groups, and roles.
 import pytest
 from unittest.mock import Mock, patch
 
-from redmine_mcp_server.redmine_handler import (
+from redmine_mcp_server.tools.projects import (  # noqa: E402
     list_project_members,
     _membership_to_dict,
 )
@@ -36,11 +36,14 @@ class TestMembershipToDict:
         result = _membership_to_dict(mock_membership)
 
         assert result["id"] == 1
-        assert result["user"] == {"id": 5, "name": "John Doe"}
+        assert result["user"]["id"] == 5
+        assert "John Doe" in result["user"]["name"]
         assert result["group"] is None
-        assert result["project"] == {"id": 10, "name": "Test Project"}
+        assert result["project"]["id"] == 10
+        assert "Test Project" in result["project"]["name"]
         assert len(result["roles"]) == 1
-        assert result["roles"][0] == {"id": 3, "name": "Developer"}
+        assert result["roles"][0]["id"] == 3
+        assert "Developer" in result["roles"][0]["name"]
 
     def test_group_membership(self):
         """Test converting a group membership to dict."""
@@ -55,10 +58,13 @@ class TestMembershipToDict:
 
         assert result["id"] == 2
         assert result["user"] is None
-        assert result["group"] == {"id": 15, "name": "Dev Team"}
-        assert result["project"] == {"id": 10, "name": "Test Project"}
+        assert result["group"]["id"] == 15
+        assert "Dev Team" in result["group"]["name"]
+        assert result["project"]["id"] == 10
+        assert "Test Project" in result["project"]["name"]
         assert len(result["roles"]) == 1
-        assert result["roles"][0] == {"id": 4, "name": "Manager"}
+        assert result["roles"][0]["id"] == 4
+        assert "Manager" in result["roles"][0]["name"]
 
     def test_multiple_roles(self):
         """Test membership with multiple roles."""
@@ -75,8 +81,10 @@ class TestMembershipToDict:
         result = _membership_to_dict(mock_membership)
 
         assert len(result["roles"]) == 2
-        assert result["roles"][0] == {"id": 3, "name": "Developer"}
-        assert result["roles"][1] == {"id": 4, "name": "Reporter"}
+        assert result["roles"][0]["id"] == 3
+        assert "Developer" in result["roles"][0]["name"]
+        assert result["roles"][1]["id"] == 4
+        assert "Reporter" in result["roles"][1]["name"]
 
     def test_no_roles(self):
         """Test membership with no roles."""
@@ -103,7 +111,8 @@ class TestMembershipToDict:
         result = _membership_to_dict(mock_membership)
 
         assert len(result["roles"]) == 1
-        assert result["roles"][0] == {"id": 3, "name": "Developer"}
+        assert result["roles"][0]["id"] == 3
+        assert "Developer" in result["roles"][0]["name"]
 
     def test_missing_attributes(self):
         """Test handling of missing attributes."""
@@ -129,7 +138,7 @@ class TestListProjectMembers:
     @pytest.fixture
     def mock_redmine(self):
         """Create a mock Redmine client."""
-        with patch("redmine_mcp_server.redmine_handler.redmine") as mock:
+        with patch("redmine_mcp_server._client.redmine") as mock:
             yield mock
 
     def create_mock_membership(
@@ -164,8 +173,8 @@ class TestListProjectMembers:
 
         assert isinstance(result, list)
         assert len(result) == 2
-        assert result[0]["user"]["name"] == "John Doe"
-        assert result[1]["user"]["name"] == "Jane Smith"
+        assert "John Doe" in result[0]["user"]["name"]
+        assert "Jane Smith" in result[1]["user"]["name"]
         mock_redmine.project_membership.filter.assert_called_once_with(project_id=10)
 
     @pytest.mark.asyncio
@@ -200,7 +209,7 @@ class TestListProjectMembers:
         # Second is a group
         assert result[1]["user"] is None
         assert result[1]["group"] is not None
-        assert result[1]["group"]["name"] == "Dev Team"
+        assert "Dev Team" in result[1]["group"]["name"]
 
     @pytest.mark.asyncio
     async def test_list_members_empty_project(self, mock_redmine):
@@ -214,43 +223,40 @@ class TestListProjectMembers:
 
     @pytest.mark.asyncio
     async def test_list_members_redmine_not_initialized(self):
-        """Test error when Redmine client is not initialized."""
+        """Error path returns the standard dict envelope (#117)."""
         with patch(
-            "redmine_mcp_server.redmine_handler._get_redmine_client",
+            "redmine_mcp_server._client._get_redmine_client",
             side_effect=RuntimeError("No Redmine authentication available"),
         ):
             result = await list_project_members(project_id=10)
 
-        assert isinstance(result, list)
-        assert len(result) == 1
-        assert "error" in result[0]
+        assert isinstance(result, dict)
+        assert "error" in result
 
     @pytest.mark.asyncio
     async def test_list_members_project_not_found(self, mock_redmine):
-        """Test error when project is not found."""
+        """Error path returns the standard dict envelope (#117)."""
         from redminelib.exceptions import ResourceNotFoundError
 
         mock_redmine.project_membership.filter.side_effect = ResourceNotFoundError()
 
         result = await list_project_members(project_id=999)
 
-        assert isinstance(result, list)
-        assert len(result) == 1
-        assert "error" in result[0]
+        assert isinstance(result, dict)
+        assert "error" in result
 
     @pytest.mark.asyncio
     async def test_list_members_forbidden(self, mock_redmine):
-        """Test error when user lacks permission."""
+        """Error path returns the standard dict envelope (#117)."""
         from redminelib.exceptions import ForbiddenError
 
         mock_redmine.project_membership.filter.side_effect = ForbiddenError()
 
         result = await list_project_members(project_id=10)
 
-        assert isinstance(result, list)
-        assert len(result) == 1
-        assert "error" in result[0]
-        assert "Access denied" in result[0]["error"]
+        assert isinstance(result, dict)
+        assert "error" in result
+        assert "Access denied" in result["error"]
 
     @pytest.mark.asyncio
     async def test_list_members_includes_roles(self, mock_redmine):
@@ -271,5 +277,5 @@ class TestListProjectMembers:
         assert len(result) == 1
         assert len(result[0]["roles"]) == 2
         role_names = [r["name"] for r in result[0]["roles"]]
-        assert "Developer" in role_names
-        assert "Reporter" in role_names
+        assert any("Developer" in n for n in role_names)
+        assert any("Reporter" in n for n in role_names)

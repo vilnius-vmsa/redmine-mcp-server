@@ -207,10 +207,10 @@ This guide covers common issues and solutions for the Redmine MCP Server.
 **Symptoms:**
 - MCP client fails to connect with `{"error":"unauthorized"}`
 - Server returns `401 Unauthorized` with a `WWW-Authenticate: Bearer` header
-- Health endpoint shows `"auth_mode":"oauth"` when you expected legacy mode
+- Health endpoint shows `"auth_mode":"oauth"` or `"auth_mode":"oauth-proxy"` when you expected legacy mode
 
-**Cause:** The server is running in OAuth mode (`REDMINE_AUTH_MODE=oauth`) instead of legacy mode. This can happen if:
-- `REDMINE_AUTH_MODE=oauth` is set in your shell environment (e.g., via `export`), which takes precedence over `.env`
+**Cause:** The server is running in OAuth mode (`REDMINE_AUTH_MODE=oauth` or `REDMINE_AUTH_MODE=oauth-proxy`) instead of legacy mode. This can happen if:
+- `REDMINE_AUTH_MODE` is set in your shell environment (e.g., via `export`), which takes precedence over `.env`
 - The `.env` file doesn't explicitly set `REDMINE_AUTH_MODE=legacy`, and a shell variable overrides the default
 - The server was started with a previous configuration and hasn't been restarted after changes
 
@@ -277,6 +277,17 @@ This guide covers common issues and solutions for the Redmine MCP Server.
 3. **Check API Access is Enabled**
    - Ensure Redmine administrator has enabled REST API
    - Check in Redmine: Administration → Settings → API → "Enable REST web service"
+
+4. **Confirm credentials with the health endpoint (legacy mode)**
+   ```bash
+   curl http://localhost:8000/health
+   ```
+   In legacy mode, `/health` probes Redmine with the configured credentials and reports the result under `checks.redmine`:
+   - `"redmine": "ok"`: credentials accepted and Redmine reachable.
+   - `"redmine": "unreachable"` with `"status": "degraded"`: credentials are present but Redmine rejected them or could not be reached (see `checks.redmine_detail`, e.g. `HTTP 401`).
+   - `"redmine": "unconfigured"` with `"status": "ok"`: `REDMINE_URL` or credentials are not set yet (not a runtime failure).
+
+   The response is always HTTP 200 so orchestrators keep treating it as a binary liveness probe; inspect the JSON `status` field for the real state.
 
 ### Username/Password Authentication Failed
 
@@ -463,6 +474,105 @@ This guide covers common issues and solutions for the Redmine MCP Server.
    ATTACHMENT_EXPIRES_MINUTES=120  # Increase expiry time
    ```
 
+4. **Download Cap Exceeded**
+   ```
+   {"error": "Attachment N exceeds the 209715200-byte download limit."}
+   ```
+   Default 200 MB cap. Bump for known-large files:
+   ```bash
+   ATTACHMENT_MAX_DOWNLOAD_BYTES=524288000  # 500 MB
+   ```
+   The cap is enforced mid-stream and the partial file is deleted on abort, so a too-large attachment doesn't leak storage.
+
+### Attachment `content_url` Returns Unreachable Internal Hostname
+
+**Symptoms:**
+- `get_redmine_issue(include_attachments=True)` returns `content_url` like `http://redmine:3000/attachments/...`
+- The URL is unreachable from your MCP client (host or open internet)
+- Agent may waste a turn `web_fetch`-ing the unreachable URL
+
+**Cause:** Redmine echoes back URLs built from its own configured hostname, which in Docker / reverse-proxy deployments is typically the internal service name. The bare API can't see your public hostname.
+
+**Solution:** set `REDMINE_PUBLIC_URL` to the publicly-reachable URL of your Redmine instance. When set, attachment `content_url` values whose origin matches `REDMINE_URL` are rewritten to the public origin (preserving path / query / fragment / reverse-proxy subpath).
+
+```bash
+# In .env file
+REDMINE_URL=http://redmine:3000              # internal, used by MCP server
+REDMINE_PUBLIC_URL=https://redmine.example.com  # public, returned to clients
+```
+
+For subpath-mounted Redmine (`https://example.com/redmine/...`), pass the full URL including the prefix:
+
+```bash
+REDMINE_PUBLIC_URL=https://example.com/redmine
+```
+
+**Alternative:** if you can't configure a public URL, call `get_redmine_attachment(attachment_id=N)` instead. That tool downloads the bytes server-side and returns either an HTTP URL on the MCP server's own proxy (HTTP mode) or a local file path (stdio mode) — both reachable from your client regardless of Redmine's hostname configuration.
+
+### Agile Fields Missing from Issue Results
+
+**Symptoms:**
+- `story_points`, `agile_sprint_id`, `agile_position` not present in `get_redmine_issue` response even though `REDMINE_AGILE_ENABLED=true`
+
+**Solutions:**
+
+1. **Verify `REDMINE_AGILE_ENABLED` is set correctly**
+   ```bash
+   # In .env file
+   REDMINE_AGILE_ENABLED=true
+   ```
+
+2. **Grant Agile permissions to the user's role**
+   - Go to **Administration → Roles and permissions**
+   - Click the role assigned to your API user
+   - Scroll to the **Agile** section and check the relevant permissions (e.g. `View board`)
+   - Save — without this, the agile endpoint returns 403 even if the module is enabled
+
+3. **Enable the Agile module for the project**
+   - Go to Project Settings → Modules in Redmine
+   - Check the **Agile** checkbox and save
+   - Without this, the agile endpoint returns 403 and fields are silently omitted
+
+4. **Verify the RedmineUP Agile plugin is installed**
+   - Access your Redmine administration panel
+   - Go to Administration → Plugins and confirm the Agile plugin is listed
+
+### Custom Field Named "story_points" Cannot Be Updated by Name
+
+**Symptoms:**
+- Passing `{"story_points": "value"}` in `update_redmine_issue` has no effect on the custom field
+- The update succeeds but the custom field value does not change
+
+**Cause:**
+The key `story_points` is reserved — it is intercepted before custom field resolution regardless of whether `REDMINE_AGILE_ENABLED` is set. When the plugin is disabled, the value is silently dropped; when enabled, it is routed to the Agile endpoint.
+
+**Solution:**
+Use the explicit `custom_fields` format with the field's numeric ID:
+```python
+update_redmine_issue(
+    issue_id=123,
+    fields={
+        "custom_fields": [{"id": 42, "value": "8"}]
+    }
+)
+```
+Find the field ID via `list_project_issue_custom_fields(project_id)`.
+
+### Agile Story Points Update Fails
+
+**Symptoms:**
+- `update_redmine_issue` with `story_points` returns an error
+- Error message mentions "Story points is invalid"
+
+**Solutions:**
+
+1. **Use a non-negative integer or `null`**
+   - Valid values: `0`, `1`, `5`, `8`, etc.
+   - Pass `null` to clear story points
+   - Negative values (e.g. `-1`) are rejected by Redmine with a 422 error
+
+2. **Check the Agile module is enabled for the project** (see above)
+
 ### Memory or Performance Issues
 
 **Symptoms:**
@@ -540,11 +650,50 @@ This guide covers common issues and solutions for the Redmine MCP Server.
    - Run MCP client's reload/refresh command
    - Reconnect to server
 
+### Deployment Lag — Recently-shipped Tool or Fix Doesn't Appear
+
+**Symptoms:**
+- You merged a fix to `develop` (or pulled a release) but the running MCP server still returns the old behavior
+- A newly-added tool isn't in the MCP client's tool list
+- A docker container shows the right version in `--version` but exposes the old surface
+
+**Cause:** new MCP tools are registered at server *startup* via `@mcp.tool()` decorators, which only run when the Python process loads the module. Behavior changes inside existing tools usually propagate without a restart (the function references in the module are the same), but **new tool registrations require restarting the server process**. In Docker, a bare `docker container restart` re-runs the same image — it doesn't pick up code changes; you need a rebuild.
+
+**Diagnosis:** call `get_mcp_server_info` to read the deployed package version:
+
+```python
+get_mcp_server_info()
+# -> {"server_version": "1.3.0", "read_only_mode": false, "auth_mode": "legacy",
+#     "plugin_flags": {...}}
+```
+
+Compare `server_version` against the release / commit you expect. If they don't match, the deployment is stale.
+
+**Solutions:**
+
+1. **Docker (recommended path):** run `./deploy.sh` from the repo root. It rebuilds the image with current source, removes the old container, and starts a fresh one with the correct port mapping (`-p 8000:8000`) and env-file.
+
+   ```bash
+   ./deploy.sh
+   ```
+
+2. **Docker without the script:**
+   ```bash
+   docker compose down
+   docker compose up -d --build   # --build is the important flag
+   ```
+
+   Without `--build`, Docker reuses the cached image, which still has the old code baked in.
+
+3. **Local Python process:** stop the running `redmine-mcp-server` / `uv run python -m redmine_mcp_server.main` and start it again. Editable installs (`uv pip install -e .`) reflect source changes on the next process start.
+
+4. **After restart, reconnect from the client.** In Claude Code, the `/mcp` command refreshes the tool list. Without that step, the client may still show the stale schema even after the server picked up the new code.
+
 ### HTTP Transport Errors
 
 **Symptoms:**
 - "HTTP transport not supported" errors
-- "Streamable HTTP failed" messages
+- "HTTP transport failed" messages
 
 **Solutions:**
 
@@ -618,7 +767,7 @@ docker logs -f <container-id>
 **Cause:** Attachment file was cleaned up or URL expired
 
 **Solution:**
-1. Generate new download URL using `get_redmine_attachment_download_url`
+1. Re-download the attachment using `get_redmine_attachment`
 2. Increase `ATTACHMENT_EXPIRES_MINUTES` in `.env`
 
 #### "Token limit exceeded"
@@ -642,8 +791,8 @@ docker logs -f <container-id>
    REDMINE_MCP_READ_ONLY=false
    ```
 2. If read-only is intentional (e.g., shared/demo instance), use only read tools:
-   - `get_redmine_issue`, `list_redmine_issues`, `list_redmine_projects`, `search_redmine_issues`, `search_entire_redmine`, `get_redmine_wiki_page`, etc.
-3. Blocked tools in read-only mode: `create_redmine_issue`, `update_redmine_issue`, `create_redmine_wiki_page`, `update_redmine_wiki_page`, `delete_redmine_wiki_page`
+   - `get_redmine_issue`, `list_redmine_issues`, `list_redmine_projects`, `search_redmine_issues`, `search_entire_redmine`, `manage_redmine_wiki_page(action="list"|"get")`, etc.
+3. Blocked tools in read-only mode: `create_redmine_issue`, `update_redmine_issue`, plus the write actions of every `manage_X` tool (e.g., `manage_redmine_wiki_page(action="create"|"update"|"delete"|"rename")`, `manage_issue_category(action="create"|"update"|"delete")`, `manage_project_member`, `manage_issue_watcher`, `manage_issue_note`, `manage_time_entry`, `manage_product(action="create"|"update")`, `manage_contact(action="create"|"update"|"delete"|"assign_to_project"|"remove_from_project")`). See [Read-Only Mode](./tool-reference.md#read-only-mode) in the tool reference for the full breakdown.
 
 #### "list_my_redmine_issues not found" / Import errors after upgrade
 
@@ -676,3 +825,58 @@ If your issue isn't covered here:
 4. **Community Support**
    - Check MCP community resources
    - Review python-redmine library documentation
+
+## OAuth Mode (v2.1+: FastMCP Native Auth Migration)
+
+### Symptom: every MCP request returns 401 (even with a valid bearer)
+
+Native OAuth authentication validates Bearer tokens via Doorkeeper's `/oauth/introspect` endpoint (RFC 7662). If every request returns 401, the cause is usually one of:
+
+1. **Introspection env vars not set.** The server fails fast at startup if `REDMINE_INTROSPECT_CLIENT_ID` or `REDMINE_INTROSPECT_CLIENT_SECRET` is missing in OAuth mode — re-check startup logs.
+2. **Introspection client not authorized.** Per RFC 7662 §2.1, a client may introspect tokens only when it is either the token's issuer, holds the `introspection` scope, or matches an `allow_token_introspection` block. Stock Redmine ships with `allow_token_introspection false`. See `docs/oauth-setup.md` Step 2b for the in-place edit of `30-redmine.rb` that grants introspection rights to confidential clients.
+3. **Doorkeeper introspection disabled in Redmine's default config.** Redmine ships `allow_token_introspection false`, which makes the `/oauth/introspect` route return 404. Verify with the curl test in `docs/oauth-setup.md` Step 2c.
+4. **A standalone `Doorkeeper.configure` initializer silently wiped Redmine's config.** Symptom: Administration → Applications also returns 403 with the log line *"Access to admin panel is forbidden due to Doorkeeper.configure.admin_authenticator being unconfigured"*. Fix: remove any standalone `Doorkeeper.configure` block from `config/initializers/`; apply the introspection change in-place in `30-redmine.rb` instead. See `docs/oauth-setup.md` Step 2b for the why (Doorkeeper's `configure` rebuilds the entire config wholesale).
+5. **Token expired.** Check the bearer's `exp` against current time; mint a fresh one if needed.
+
+**Quick diagnostic:** hit `/health` on the MCP server. If `"status": "degraded"` with `"introspection": "unreachable"`, the problem is server-side (introspection endpoint or credentials). If `"status": "ok"`, the introspection client itself works, so the problem is per-token (expired, wrong app, etc.).
+
+### Symptom: `/health` reports `"introspection": "unreachable"`
+
+Likely causes, in order:
+
+- `REDMINE_URL` unreachable from the MCP server's network.
+- `REDMINE_INTROSPECT_CLIENT_*` credentials wrong (Doorkeeper returns HTTP 401 on the introspection POST).
+- Doorkeeper introspection endpoint disabled.
+- TLS verification failing (check `REDMINE_SSL_VERIFY` / `REDMINE_SSL_CERT`).
+
+The probe result is cached for `HEALTH_INTROSPECTION_TTL_SECONDS` (default 30 seconds). Wait that long after fixing the underlying issue before re-checking `/health`.
+
+### Symptom: clients see 401 where they used to see 503
+
+This is by design after the FastMCP v3 auth migration. The previous middleware returned `503 upstream_unavailable` when Redmine was unreachable for token validation; FastMCP's `IntrospectionTokenVerifier` treats transport failures as auth failures and returns 401. Operators monitoring for 503 spikes should switch to:
+
+- Watching `/health` for `"status": "degraded"`, OR
+- Monitoring 401-rate spikes correlated with Redmine availability metrics.
+
+### Emergency rollback from OAuth mode
+
+If an OAuth-mode regression is impacting users and a fix is not immediate, fall back to legacy mode without redeploying a previous version:
+
+1. Set `REDMINE_AUTH_MODE=legacy` in the environment.
+2. Provide `REDMINE_API_KEY` (or `REDMINE_USERNAME` + `REDMINE_PASSWORD`).
+3. Restart the MCP server.
+
+Legacy mode is preserved across versions and behaves identically to pre-OAuth deployments. Clients lose per-user scoping but regain availability.
+
+If a legacy API key isn't available, revert to the previous application version via standard release rollback procedures (`RELEASE_SOP.md`).
+
+### Symptom: clients fetching `/.well-known/oauth-protected-resource` (without `/mcp`) get 404
+
+The v2.1+ release dropped several discovery path aliases. Only these paths remain:
+
+- `GET /.well-known/oauth-protected-resource/mcp` (canonical RFC 9728 §3.1 suffix-scoped form, mounted by `RemoteAuthProvider`)
+- `GET /.well-known/oauth-authorization-server/mcp` (path-scoped RFC 8414 form, mirrors Redmine's Doorkeeper AS metadata in direct OAuth mode)
+
+In `REDMINE_AUTH_MODE=oauth-proxy`, the authorization-server metadata describes FastMCP's OAuthProxy endpoints instead.
+
+Clients should follow `WWW-Authenticate: Bearer resource_metadata="..."` headers from 401 responses (RFC 9728 §5.3) rather than guessing paths. If a client hardcodes the dropped variants, update the client; we don't plan to restore aliases.

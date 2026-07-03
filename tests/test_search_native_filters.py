@@ -13,7 +13,7 @@ import sys
 # Add the src directory to the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from redmine_mcp_server.redmine_handler import search_redmine_issues  # noqa: E402
+from redmine_mcp_server.tools.issues import search_redmine_issues  # noqa: E402
 
 
 class TestSearchNativeFilters:
@@ -22,7 +22,7 @@ class TestSearchNativeFilters:
     @pytest.fixture
     def mock_redmine(self):
         """Create a mock Redmine client."""
-        with patch("redmine_mcp_server.redmine_handler.redmine") as mock:
+        with patch("redmine_mcp_server._client.redmine") as mock:
             yield mock
 
     def create_mock_issue(self, issue_id=1):
@@ -109,15 +109,15 @@ class TestSearchNativeFilters:
 
     @pytest.mark.asyncio
     async def test_open_issues_false(self, mock_redmine):
-        """Test open_issues=False parameter is passed to API."""
+        """Test open_issues=False (default) is not passed to API."""
         mock_issue = self.create_mock_issue()
         mock_redmine.issue.search.return_value = [mock_issue]
 
         result = await search_redmine_issues("bug", open_issues=False)  # noqa: F841
 
-        # Verify API was called with open_issues parameter
+        # Verify open_issues=False is not forwarded (it's the default/falsy)
         call_args = mock_redmine.issue.search.call_args
-        assert call_args[1]["open_issues"] is False
+        assert "open_issues" not in call_args[1]
 
     @pytest.mark.asyncio
     async def test_scope_and_open_issues_combined(self, mock_redmine):
