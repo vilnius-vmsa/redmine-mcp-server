@@ -9,6 +9,19 @@ services:
       - "${HOST_PORT:-8000}:8000"
     env_file:
       - .env
+    environment:
+      # Explicit empty values override any legacy inline entries in `.env`;
+      # get_secret() then falls back to the corresponding *_FILE value.
+      REDMINE_INTROSPECT_CLIENT_SECRET: ""
+      REDMINE_INTROSPECT_CLIENT_SECRET_FILE: /run/secrets/redmine_introspect_client_secret
+      REDMINE_MCP_JWT_SIGNING_KEY: ""
+      REDMINE_MCP_JWT_SIGNING_KEY_FILE: /run/secrets/redmine_mcp_jwt_signing_key
+    # Production credentials are files, not container environment variables.
+    # The manual deploy workflow creates these files from GitHub Environment
+    # secrets immediately before `docker compose up`.
+    secrets:
+      - redmine_introspect_client_secret
+      - redmine_mcp_jwt_signing_key
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
@@ -25,3 +38,9 @@ services:
 networks:
   redmine-mcp-network:
     driver: bridge
+
+secrets:
+  redmine_introspect_client_secret:
+    file: "${REDMINE_INTROSPECT_SECRET_PATH:?Set REDMINE_INTROSPECT_SECRET_PATH to the runtime secret file}"
+  redmine_mcp_jwt_signing_key:
+    file: "${REDMINE_MCP_JWT_SIGNING_KEY_PATH:?Set REDMINE_MCP_JWT_SIGNING_KEY_PATH to the runtime secret file}"
