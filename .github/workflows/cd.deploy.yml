@@ -1,0 +1,138 @@
+name: "CD: Deploy"
+
+on:
+  repository_dispatch:
+    types: [deploy-production]
+  workflow_dispatch:
+    inputs:
+      image_ref:
+        description: Immutable ghcr.io image reference (image@sha256:digest).
+        required: true
+        type: string
+      build_sha:
+        description: Commit that produced the image.
+        required: true
+        type: string
+      branch:
+        description: Production source branch.
+        required: true
+        default: main
+        type: choice
+        options: [main]
+
+env:
+  IMAGE_REF: ${{ github.event.client_payload.image_ref || inputs.image_ref }}
+  BUILD_SHA: ${{ github.event.client_payload.build_sha || inputs.build_sha }}
+  DEPLOY_BRANCH: ${{ github.event.client_payload.branch || inputs.branch }}
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+permissions:
+  attestations: read
+  contents: read
+  packages: read
+
+jobs:
+  set_env:
+    name: Resolve deploy environment
+    runs-on: ubuntu-latest
+    outputs:
+      env_var: ${{ steps.environment.outputs.env_var }}
+    steps:
+      - name: Validate deployment inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$IMAGE_REF" =~ ^ghcr\.io/[a-z0-9][a-z0-9._/-]*@sha256:[a-f0-9]{64}$ ]]; then
+            echo "IMAGE_REF must be an immutable lowercase ghcr.io digest." >&2
+            exit 1
+          fi
+          if [[ ! "$BUILD_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "BUILD_SHA must be a full commit SHA." >&2
+            exit 1
+          fi
+          if [ "$DEPLOY_BRANCH" != main ]; then
+            echo "Only main may deploy to production." >&2
+            exit 1
+          fi
+
+      - name: Determine environment
+        id: environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "env_var=production" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy to ${{ env.DEPLOY_BRANCH }} (${{ needs.set_env.outputs.env_var }})
+    needs: set_env
+    runs-on: mcp
+    environment: ${{ needs.set_env.outputs.env_var }}
+    timeout-minutes: 20
+    steps:
+
+      - name: Check out deployment configuration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BUILD_SHA }}
+          # The ancestry check below needs the complete main history, not the
+          # default one-commit checkout.
+          fetch-depth: 0
+          sparse-checkout: docker-compose.production.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Require a main-branch source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$DEPLOY_BRANCH"
+          git merge-base --is-ancestor "$BUILD_SHA" "origin/$DEPLOY_BRANCH"
+          echo "${BUILD_SHA} is reachable from ${DEPLOY_BRANCH}; production deployment allowed."
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify image provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          command -v gh >/dev/null
+          gh attestation verify "oci://${IMAGE_REF}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/ci.build.yml"
+
+      - name: Write runtime configuration
+        shell: bash
+        env:
+          ENV_FILE: ${{ secrets.ENV }}
+        run: |
+          set -euo pipefail
+          test -n "$ENV_FILE"
+          umask 077
+          printf '%s\n' "$ENV_FILE" > .env
+
+      - name: Pull and deploy verified image
+        shell: bash
+        run: |
+          set -euo pipefail
+          export REDMINE_MCP_IMAGE="$IMAGE_REF"
+          docker compose -f docker-compose.production.yml config --quiet
+          docker compose -f docker-compose.production.yml pull
+          docker compose -f docker-compose.production.yml up -d \
+            --force-recreate --wait --wait-timeout 120 --remove-orphans
+
+      - name: Verify local health endpoint
+        shell: bash
+        run: curl --fail --silent --show-error --max-time 15 http://127.0.0.1:8000/health >/dev/null
+
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.production.yml logs --no-color --tail=200

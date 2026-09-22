@@ -1,0 +1,92 @@
+name: "CI: Test image"
+
+on:
+  workflow_call:
+    inputs:
+      image_ref:
+        description: Immutable image reference to smoke-test.
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      image_ref:
+        description: Immutable ghcr.io image reference (image@sha256:digest).
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  smoke-test:
+    name: Smoke-test published image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      IMAGE_REF: ${{ inputs.image_ref }}
+      CONTAINER_NAME: redmine-mcp-image-test-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Validate immutable image reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$IMAGE_REF" =~ ^ghcr\.io/[a-z0-9][a-z0-9._/-]*@sha256:[a-f0-9]{64}$ ]]; then
+            echo "An immutable lowercase ghcr.io image digest is required." >&2
+            exit 1
+          fi
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Pull published image
+        run: docker pull "$IMAGE_REF"
+
+      - name: Start image with disposable configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --rm \
+            --name "$CONTAINER_NAME" \
+            --publish 127.0.0.1:8000:8000 \
+            --env REDMINE_URL= \
+            "$IMAGE_REF"
+
+      - name: Wait for Docker health check
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in {1..24}; do
+            status="$(docker inspect --format '{{.State.Health.Status}}' "$CONTAINER_NAME")"
+            if [ "$status" = healthy ]; then
+              exit 0
+            fi
+            if [ "$status" = unhealthy ]; then
+              docker logs "$CONTAINER_NAME"
+              exit 1
+            fi
+            sleep 5
+          done
+          docker logs "$CONTAINER_NAME"
+          echo "Image did not become healthy in time." >&2
+          exit 1
+
+      - name: Verify HTTP health endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          response="$(curl --fail --silent --show-error http://127.0.0.1:8000/health)"
+          echo "$response" | jq --exit-status \
+            '.service == "redmine_mcp_tools" and .status == "ok"' >/dev/null
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker logs "$CONTAINER_NAME" || true
+
+      - name: Remove disposable container
+        if: always()
+        run: docker rm --force "$CONTAINER_NAME" || true

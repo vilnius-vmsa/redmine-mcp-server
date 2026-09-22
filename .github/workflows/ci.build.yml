@@ -1,0 +1,156 @@
+name: "CI: Build & Push Image"
+
+on:
+  workflow_run:
+    workflows: ["CI: Validate"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
+  BUILD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+  BUILD_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+
+concurrency:
+  group: production-image-build
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  set_env:
+    name: Resolve build environment
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main')
+    outputs:
+      env_var: ${{ steps.environment.outputs.env_var }}
+    steps:
+      - name: Determine environment
+        id: environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$BUILD_BRANCH" != main ]; then
+            echo "Only main may build a production image." >&2
+            exit 1
+          fi
+          echo "env_var=production" >> "$GITHUB_OUTPUT"
+
+  build-image:
+    name: Build image — ${{ github.ref_name }} (${{ needs.set_env.outputs.env_var }})
+    needs: set_env
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      IMAGE_ENVIRONMENT: ${{ needs.set_env.outputs.env_var }}
+      IMAGE_NAME: ${{ env.IMAGE_REPOSITORY }}-${{ needs.set_env.outputs.env_var }}
+    outputs:
+      image_ref: ${{ steps.image.outputs.image_ref }}
+      source_sha: ${{ steps.image.outputs.source_sha }}
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BUILD_SHA }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:sha-${{ env.BUILD_SHA }}
+          labels: |
+            org.opencontainers.image.revision=${{ env.BUILD_SHA }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Scan published image for critical vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:sha-${{ env.BUILD_SHA }}
+          format: table
+          ignore-unfixed: true
+          severity: CRITICAL
+          exit-code: "1"
+
+      - name: Record immutable image reference
+        id: image
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          image_ref="${IMAGE_NAME}@${IMAGE_DIGEST}"
+          echo "image_ref=${image_ref}" >> "$GITHUB_OUTPUT"
+          echo "source_sha=${BUILD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Published ${image_ref}"
+
+      - name: Attest image build provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+  test-image:
+    name: Test published image
+    needs: build-image
+    uses: ./.github/workflows/ci.test-image.yml
+    with:
+      image_ref: ${{ needs.build-image.outputs.image_ref }}
+    permissions:
+      contents: read
+      packages: read
+
+  trigger-deploy:
+    name: Trigger production deployment
+    needs: [set_env, build-image, test-image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Dispatch smoke-tested image deployment
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_REF: ${{ needs.build-image.outputs.image_ref }}
+          BUILD_SHA: ${{ needs.build-image.outputs.source_sha }}
+          DEPLOY_BRANCH: main
+        run: |
+          set -euo pipefail
+          payload="$(jq -cn \
+            --arg image_ref "$IMAGE_REF" \
+            --arg build_sha "$BUILD_SHA" \
+            --arg branch "$DEPLOY_BRANCH" \
+            '{event_type: "deploy-production", client_payload: {image_ref: $image_ref, build_sha: $build_sha, branch: $branch}}')"
+          curl --fail --silent --show-error \
+            --request POST \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --url "https://api.github.com/repos/${GITHUB_REPOSITORY}/dispatches" \
+            --data "$payload"
