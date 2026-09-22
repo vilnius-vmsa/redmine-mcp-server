@@ -753,6 +753,24 @@ class TestGetRedmineAttachment:
     @pytest.mark.asyncio
     @patch("redmine_mcp_server._client.redmine")
     @patch("redmine_mcp_server._cleanup._ensure_cleanup_started")
+    async def test_public_base_path_prefixes_generated_file_url(
+        self, mock_cleanup, mock_redmine, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("ATTACHMENTS_DIR", str(tmp_path))
+        monkeypatch.setenv("PUBLIC_HOST", "mcp.example.com")
+        monkeypatch.setenv("PUBLIC_PORT", "443")
+        monkeypatch.setenv("PUBLIC_BASE_PATH", "/redmine-mcp/")
+
+        mock_redmine.attachment.get.return_value = _mock_attachment()
+        mock_redmine.download.return_value = _mock_stream()
+
+        result = await get_redmine_attachment(1)
+
+        assert result["uri"].startswith("https://mcp.example.com/redmine-mcp/files/")
+
+    @pytest.mark.asyncio
+    @patch("redmine_mcp_server._client.redmine")
+    @patch("redmine_mcp_server._cleanup._ensure_cleanup_started")
     async def test_public_port_80_omits_port(
         self, mock_cleanup, mock_redmine, tmp_path, monkeypatch
     ):
