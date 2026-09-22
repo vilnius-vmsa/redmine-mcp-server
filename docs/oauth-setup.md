@@ -4,6 +4,8 @@ Set up the MCP server so each user authenticates with their own Redmine account.
 
 **Requirements:** Redmine 6.1+ and admin access to register an OAuth application.
 
+> **No OAuth on your Redmine?** Easy Redmine and Redmine older than 6.1 have no Doorkeeper. Use `REDMINE_AUTH_MODE=api-key-login` instead: clients connect the same way, and each user logs in once with their own API key. See the [api-key-login guide](api-key-login-auth.md).
+
 This guide covers both direct Redmine Bearer-token mode (`REDMINE_AUTH_MODE=oauth`) and hosted OAuthProxy mode (`REDMINE_AUTH_MODE=oauth-proxy`). In `oauth-proxy` mode, FastMCP handles DCR/CIMD for MCP clients and uses Redmine as the upstream OAuth provider and external consent screen.
 
 ## Step 1: Register an OAuth App in Redmine
@@ -97,8 +99,10 @@ REDMINE_AUTH_MODE=oauth-proxy
 REDMINE_MCP_JWT_SIGNING_KEY=<stable-random-secret>
 # Or: REDMINE_MCP_JWT_SIGNING_KEY_FILE=/run/secrets/redmine_mcp_jwt_signing_key
 
-# Optional: mount this directory to persistent storage in container deployments.
-# OAuthProxy stores encrypted state below FASTMCP_HOME/oauth-proxy/.
+# Where OAuthProxy keeps its encrypted state (below FASTMCP_HOME/oauth-proxy/).
+# The Docker image already sets this to /app/data/fastmcp, which docker-compose
+# mounts as a volume. Set it yourself only for a non-compose deployment, and use
+# a host path for a local run, since /app exists only inside the image.
 # FASTMCP_HOME=/app/data/fastmcp
 
 # Optional: restrict which client redirect URIs are accepted (see note below).
@@ -119,6 +123,15 @@ Set these in `.env` (local) or `.env.docker` (Docker). Legacy credentials are no
 **Upstream OAuth client:** When `REDMINE_OAUTH_CLIENT_ID` / `REDMINE_OAUTH_CLIENT_SECRET` are unset, the introspection client (Step 2) is reused as the upstream authorization client. That client therefore needs more than introspection rights: it must have the **authorization code** grant enabled and `${REDMINE_MCP_BASE_URL}/auth/callback` registered as a redirect URI, otherwise `/authorize` fails upstream. This is already true if the introspection client is the Step 1 user-flow app; if you registered a separate introspection-only app, either enable the authorization code grant and redirect URI on it or set `REDMINE_OAUTH_CLIENT_ID` / `REDMINE_OAUTH_CLIENT_SECRET` to a dedicated upstream app.
 
 **Storage and scaling:** OAuthProxy keeps client registrations, in-flight authorization transactions, and upstream-token mappings in an encrypted file store under `FASTMCP_HOME/oauth-proxy/`. This store is **node-local**, so a request that registers on one instance and continues on another will fail. Run `oauth-proxy` mode as a single replica, or with sticky sessions, unless you provide a shared `OAuthProxy` `client_storage` backend. Mounting `FASTMCP_HOME` to a persistent volume addresses durability across restarts but not cross-replica consistency.
+
+**Persisting the store across rebuilds:** the store has to sit on a volume, or every `docker compose up -d --build` discards it and each client has to reauthorize. Nothing errors when this is wrong, so the server logs the resolved directory at startup (`OAuthProxy state directory: ...`) and warns when `FASTMCP_HOME` is unset. Check that line first when sessions disappear after a deploy.
+
+- The image sets `FASTMCP_HOME=/app/data/fastmcp` and `docker-compose.yml` mounts `./data:/app/data`, so the default compose deployment is already durable.
+- A `docker run` without an env file inherits the same default, but still needs `-v` on `/app/data` to keep anything.
+- The container runs as uid 1000 (`appuser`). An empty named volume inherits ownership from the image directory it covers, so it works as-is. A **bind mount** does not inherit: on Linux the host directory's owner applies, so `./data` must be writable by uid 1000. A volume that already holds root-owned content stays root-owned and the write fails; remove the volume rather than trying to repair it.
+- The store directory is keyed by a fingerprint of `REDMINE_MCP_JWT_SIGNING_KEY`. Changing that key orphans the existing state just as effectively as losing the volume, which is why the key has to be stable and set explicitly rather than generated per deploy.
+
+**Expired records:** FastMCP's file store stops serving a record when its TTL passes but never deletes the file. The server deletes expired files below `FASTMCP_HOME/oauth-proxy/` itself, every `CLEANUP_INTERVAL_MINUTES` (default 10) from boot, whatever `AUTO_CLEANUP_ENABLED` says. Client registrations carry no TTL in FastMCP, so they are kept; on a public deployment, rate-limit `POST /register` at the reverse proxy to bound them.
 
 **Startup behavior:** When `REDMINE_AUTH_MODE=oauth` is set, the server fails fast at startup if `REDMINE_INTROSPECT_CLIENT_ID` or `REDMINE_INTROSPECT_CLIENT_SECRET` is missing — better to surface the misconfiguration immediately than to return 401 on every request.
 
@@ -154,6 +167,18 @@ curl http://localhost:8000/health
 
 If `/health` returns `"status": "degraded"` with `"introspection": "unreachable"`, the introspection client is misconfigured (see Step 2 — verify the client is **confidential** and that the `allow_token_introspection` block in `30-redmine.rb` was applied per Step 2b).
 
+### Endpoints exposed in OAuth mode
+
+In both `oauth` and `oauth-proxy` modes the server exposes the OAuth2 metadata and token-management endpoints that MCP clients rely on:
+
+| Endpoint | Standard | Purpose |
+|----------|----------|---------|
+| `/.well-known/oauth-protected-resource/mcp` | RFC 9728 §3.1 | Tells clients where to find the authorization server (mounted by FastMCP `RemoteAuthProvider`) |
+| `/.well-known/oauth-authorization-server/mcp` | RFC 8414 | Advertises Redmine's Doorkeeper OAuth endpoints, scoped to this MCP resource |
+| `POST /revoke` | RFC 7009 | Revokes an OAuth2 token (proxies to Redmine's `/oauth/revoke`) |
+
+Redmine uses the [Doorkeeper](https://github.com/doorkeeper-gem/doorkeeper) gem for OAuth2 but does not serve the RFC 8414 discovery document itself. This server serves path-scoped metadata on Redmine's behalf, pointing to Redmine's real `/oauth/authorize`, `/oauth/token`, and `/oauth/revoke` endpoints.
+
 ## Step 5: Connect Your MCP Client
 
 MCP clients handle the OAuth flow automatically — when connecting to the server, the client opens a browser for the user to log in to Redmine. No manual token management needed.
@@ -181,6 +206,96 @@ Set this in Redmine's OAuth app (Step 1) to match your client:
 
 > **Note on DCR:** Some clients (Claude Desktop, VS Code) expect Dynamic Client Registration. Redmine's Doorkeeper does not support DCR, so you must pre-register the app manually (Step 1) and configure the client with the `client_id`/`client_secret`.
 > Use `REDMINE_AUTH_MODE=oauth-proxy` when MCP clients need DCR/CIMD onboarding.
+
+## Scope Enforcement
+
+The server enforces OAuth scopes per tool (on by default). Every MCP
+tool maps to the Redmine permission scopes it needs, and a
+call is refused with code `INSUFFICIENT_SCOPE` when the access token
+does not carry them. `tools/list` only shows the tools the token can
+use. Tokens with the `admin` scope bypass the check, matching Redmine's
+own semantics.
+
+The authoritative tool-to-scope map is `TOOL_SCOPES` in
+`src/redmine_mcp_server/oauth_scopes.py`.
+
+Notes:
+
+- The map gates each tool's base permission. Argument-conditional
+  permissions (for example `manage_subtasks` when changing
+  `parent_issue_id`, or tag scopes for `tag_list`) are still enforced
+  by Redmine itself.
+- RedmineUP plugin tools (`manage_product`, `manage_contact`,
+  `manage_deal`, checklists) do not require plugin scopes in the map;
+  Redmine enforces its own plugin permissions for them. `manage_contact`
+  and `manage_deal` are special cases: setting `REDMINE_CRM_ENABLED` adds
+  the contacts permissions to the advertised scopes and
+  `REDMINE_DEALS_ENABLED` adds the deal permissions, because Redmine
+  intersects a token's scopes with the user's role permissions and would
+  otherwise deny every contacts call and every deals call. They are advertised so the token can carry them, but not
+  required here, since a deployment with the flag off never advertises
+  them. Grant them on the OAuth application when enabling either flag.
+- Deals sit behind their own flag rather than `REDMINE_CRM_ENABLED`
+  because the CRM plugin's Light edition defines no deal permissions at
+  all. Redmine builds its OAuth scope list from
+  `Redmine::AccessControl.permissions` and applies
+  `enforce_configured_scopes`, so on Light a deal scope cannot be held by
+  the OAuth application and requesting it fails consent with
+  `invalid_scope` -- which would break `manage_contact` too.
+- A notes-only `update_redmine_issue` call (fields containing nothing but
+  `notes` / `private_notes`, no uploads) requires `add_issue_notes` instead
+  of `edit_issues`, mirroring Redmine's own note-adding permission.
+
+### Tokens issued before scope enforcement
+
+Tokens obtained before scopes were requested (or from OAuth apps with a
+blank scope list) introspect with empty scopes and will be denied for
+every tool. Fix: update the OAuth application's scopes in Redmine,
+disconnect and re-authorize the MCP client so a new consent grants the
+scopes. As a temporary bridge you can set:
+
+```bash
+REDMINE_OAUTH_SCOPE_ENFORCEMENT=off
+```
+
+which restores the pre-enforcement behavior (any active token can call
+any tool) and logs a warning at startup. Re-enable it once clients have
+re-consented.
+
+### Cursor and self-AS discovery
+
+Some MCP clients (for example Cursor) discover the authorization server by
+probing its canonical RFC 8414 well-known location. Because stock `oauth`
+mode names Redmine as the authorization server and no released Redmine
+Doorkeeper serves `/.well-known/oauth-authorization-server`, those clients
+fail discovery.
+
+Set `REDMINE_OAUTH_DISCOVERY_AS=self` so this server advertises itself as the
+authorization server (issuer = `REDMINE_MCP_BASE_URL`) and serves the RFC 8414
+document at its own canonical well-known location. Authorize and token
+requests still go directly to Redmine `/oauth/authorize` and `/oauth/token`,
+so the client keeps using its static confidential client registered in
+Redmine. This mode is opt-in; the default `redmine` mode is unchanged.
+
+If the Redmine OAuth Application enables only a subset of permissions, also
+set `REDMINE_MCP_SCOPES` to that subset so the advertised `scopes_supported`
+matches what the Application can grant and consent does not fail with
+`invalid_scope`.
+
+`REDMINE_MCP_SCOPES` is a subset of the scopes this server already advertises
+(the Redmine permissions its tools actually use), not a mirror of the
+Application's full permission list. Permissions your Application grants but no
+MCP tool uses (for example `view_gantt`, `copy_issues`, `edit_own_time_entries`)
+are not in that set and are rejected at boot; leave them out of
+`REDMINE_MCP_SCOPES`. The boot error lists the full set of accepted scopes.
+
+Note: `REDMINE_OAUTH_DISCOVERY_AS` and `REDMINE_MCP_SCOPES` apply to `oauth`
+mode only and are ignored in `oauth-proxy` mode, where this server is the
+authorization-server gateway.
+
+The `oauth-proxy` mode is a different model (this server proxies authorize and
+token and issues its own client registrations); it is the alternative when you
+want a full authorization-server gateway rather than direct-to-Redmine consent.
 
 ## Migrating from Legacy Mode
 

@@ -25,9 +25,17 @@ RUN uv venv /opt/venv && \
 FROM python:3.13-slim AS runtime
 
 # Set environment variables
+# SERVER_HOST/SERVER_PORT default to a reachable binding so ad-hoc
+# `docker run` works without a full env file; override via env_file or -e.
+# FASTMCP_HOME points at /app/data so oauth-proxy state (client
+# registrations, upstream tokens) lands on the mounted volume instead of
+# the container filesystem, where a rebuild would discard it.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PATH="/opt/venv/bin:$PATH"
+    PATH="/opt/venv/bin:$PATH" \
+    SERVER_HOST=0.0.0.0 \
+    SERVER_PORT=8000 \
+    FASTMCP_HOME=/app/data/fastmcp
 
 # Install system dependencies
 RUN apt-get update && \
@@ -51,7 +59,7 @@ COPY --chown=appuser:appuser src/ ./src/
 COPY --chown=appuser:appuser README.md ./
 
 # Create directories for logs and data
-RUN mkdir -p /app/logs /app/data && \
+RUN mkdir -p /app/logs /app/data /app/data/fastmcp && \
     chown -R appuser:appuser /app
 
 # Switch to non-root user
@@ -59,10 +67,10 @@ USER appuser
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:${SERVER_PORT:-8000}/health || exit 1
 
-# Expose port
+# Expose default port (informational only; override with SERVER_PORT env var)
 EXPOSE 8000
 
 # Default command
-CMD ["python", "-m", "uvicorn", "src.redmine_mcp_server.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["redmine-mcp-server"]

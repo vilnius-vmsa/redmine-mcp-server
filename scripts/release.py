@@ -10,12 +10,18 @@ Examples:
     python scripts/release.py minor           # 0.12.1 -> 0.13.0
     python scripts/release.py major           # 0.12.1 -> 1.0.0
     python scripts/release.py patch --dry-run # Preview changes
+    python scripts/release.py --sync-contributors  # Refresh README credits only
 
 Gitflow:
     1. Start from develop branch
     2. Pre-flight: clean tree, tests pass, dependency audit clean
     3. Create release/vX.Y.Z branch and bump versions
-    4. Draft + approve release notes via claude -p (persisted for recovery)
+    4. Draft + approve release notes via claude -p (persisted for recovery).
+       To edit the notes in any app instead of mid-release: `--dry-run`
+       saves the draft to release_notes_vX.Y.Z.md, and the real run
+       publishes that file as approved (or pass `--notes-file PATH`). It is
+       checked for the right version and every contributor credit before
+       anything is branched.
     5. Merge to master, push tag (triggers publish-pypi.yml)
     6. Wait for publish-pypi workflow to finish (poll gh run status)
     7. Wait for the version to appear on PyPI (JSON API)
@@ -78,7 +84,7 @@ def run_command(
 def get_current_version(project_root: Path) -> str:
     """Read current version from pyproject.toml."""
     pyproject = project_root / "pyproject.toml"
-    content = pyproject.read_text()
+    content = pyproject.read_text(encoding="utf-8")
     match = re.search(r'^version\s*=\s*"([^"]+)"', content, re.MULTILINE)
     if not match:
         print("Error: Could not find version in pyproject.toml")
@@ -211,7 +217,7 @@ def preflight_checks(config: ReleaseConfig) -> None:
         print(export_result.stdout)
         print(export_result.stderr)
         sys.exit(1)
-    Path(requirements_path).write_text(export_result.stdout)
+    Path(requirements_path).write_text(export_result.stdout, encoding="utf-8")
     result = run_command(
         ["bash", str(audit_script), "-r", requirements_path, "--strict"],
         check=False,
@@ -266,7 +272,7 @@ def preflight_checks(config: ReleaseConfig) -> None:
 def update_pyproject_toml(project_root: Path, new_version: str, dry_run: bool) -> None:
     """Update version in pyproject.toml."""
     pyproject = project_root / "pyproject.toml"
-    content = pyproject.read_text()
+    content = pyproject.read_text(encoding="utf-8")
     new_content = re.sub(
         r'^(version\s*=\s*)"[^"]+"',
         f'\\1"{new_version}"',
@@ -277,14 +283,14 @@ def update_pyproject_toml(project_root: Path, new_version: str, dry_run: bool) -
     if dry_run:
         print(f"  [DRY-RUN] Would update pyproject.toml version to {new_version}")
     else:
-        pyproject.write_text(new_content)
+        pyproject.write_text(new_content, encoding="utf-8")
         print("  ✓ Updated pyproject.toml")
 
 
 def update_server_json(project_root: Path, new_version: str, dry_run: bool) -> None:
     """Update version in server.json (both occurrences)."""
     server_json = project_root / "server.json"
-    content = json.loads(server_json.read_text())
+    content = json.loads(server_json.read_text(encoding="utf-8"))
 
     content["version"] = new_version
     if "packages" in content and len(content["packages"]) > 0:
@@ -293,8 +299,77 @@ def update_server_json(project_root: Path, new_version: str, dry_run: bool) -> N
     if dry_run:
         print(f"  [DRY-RUN] Would update server.json version to {new_version}")
     else:
-        server_json.write_text(json.dumps(content, indent=2) + "\n")
+        server_json.write_text(json.dumps(content, indent=2) + "\n", encoding="utf-8")
         print("  ✓ Updated server.json")
+
+
+CONTRIBUTORS_START = "<!-- contributors:start -->"
+CONTRIBUTORS_END = "<!-- contributors:end -->"
+
+
+def collect_changelog_contributors(changelog: str) -> list[str]:
+    """Every handle credited in a `### Contributors` block, oldest credit first.
+
+    The CHANGELOG is newest-release-first, so the blocks are walked in reverse:
+    a contributor keeps the position of their earliest credit and appending a
+    new name never reshuffles the rendered line. Both credit punctuations used
+    in this changelog are matched (``- @handle — ...`` and ``- @handle, ...``);
+    a handle merely mentioned in prose is not a credit.
+    """
+    blocks = re.findall(
+        r"^### Contributors\s*$\n(.*?)(?=^#{2,3} |\Z)",
+        changelog,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    handles: list[str] = []
+    for block in reversed(blocks):
+        for handle in re.findall(r"^-\s+@([A-Za-z0-9](?:[A-Za-z0-9-]*))", block, re.M):
+            if handle not in handles:
+                handles.append(handle)
+    return handles
+
+
+def render_contributors_line(handles: list[str]) -> str:
+    return " · ".join(f"[@{h}](https://github.com/{h})" for h in handles)
+
+
+def update_readme_contributors(project_root: Path, dry_run: bool) -> None:
+    """Regenerate the README Contributors list from the CHANGELOG credits.
+
+    The contrib.rocks strip below the list only shows commit authors, so this
+    handle line is what credits reporters and testers. Hand-maintaining it
+    drifted badly: six credited people were missing when this was written,
+    three of them merged-PR authors.
+    """
+    readme = project_root / "README.md"
+    content = readme.read_text(encoding="utf-8")
+    line = render_contributors_line(
+        collect_changelog_contributors(
+            (project_root / "CHANGELOG.md").read_text(encoding="utf-8")
+        )
+    )
+
+    new_content, count = re.subn(
+        rf"{re.escape(CONTRIBUTORS_START)}\n.*?\n{re.escape(CONTRIBUTORS_END)}",
+        f"{CONTRIBUTORS_START}\n{line}\n{CONTRIBUTORS_END}",
+        content,
+        count=1,
+        flags=re.DOTALL,
+    )
+    if count == 0:
+        raise RuntimeError(
+            f"Could not find the {CONTRIBUTORS_START} / {CONTRIBUTORS_END} "
+            "markers in README.md. Restore them or update this function; "
+            "without them the release silently stops crediting contributors."
+        )
+
+    if dry_run:
+        print("  [DRY-RUN] Would sync README.md Contributors list")
+    elif new_content == content:
+        print("  ✓ README.md Contributors list already current")
+    else:
+        readme.write_text(new_content, encoding="utf-8")
+        print("  ✓ Updated README.md Contributors list")
 
 
 def update_changelog(project_root: Path, new_version: str, dry_run: bool) -> None:
@@ -305,7 +380,7 @@ def update_changelog(project_root: Path, new_version: str, dry_run: bool) -> Non
     loud instead so the user fills it in before the release goes out.
     """
     changelog = project_root / "CHANGELOG.md"
-    content = changelog.read_text()
+    content = changelog.read_text(encoding="utf-8")
     today = date.today().strftime("%Y-%m-%d")
 
     # Require an [Unreleased] section that exists and has real content.
@@ -361,7 +436,7 @@ def update_changelog(project_root: Path, new_version: str, dry_run: bool) -> Non
     if dry_run:
         print(f"  [DRY-RUN] Would update CHANGELOG.md with version {new_version}")
     else:
-        changelog.write_text(new_content)
+        changelog.write_text(new_content, encoding="utf-8")
         print("  ✓ Updated CHANGELOG.md")
 
 
@@ -380,11 +455,53 @@ def update_uv_lock(project_root: Path, dry_run: bool) -> None:
         print("  ✓ Updated uv.lock")
 
 
+def _contributor_entries(contrib_text: str) -> list[str]:
+    """Split a ``### Contributors`` block into one string per credit.
+
+    Entries wrap across lines in the CHANGELOG, and the continuation lines
+    carry the PR links the credit format requires. Reading line by line and
+    keeping only those starting with ``- `` truncated every entry at its first
+    line, which is how the published v2.13.0 notes ended mid-sentence with no
+    links at all.
+    """
+    entries: list[str] = []
+    for line in contrib_text.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("- "):
+            entries.append(stripped[2:].strip())
+        elif entries:
+            entries[-1] = f"{entries[-1]} {stripped}"
+    return entries
+
+
+def _parse_contributor_entry(entry: str) -> tuple[str, str] | None:
+    """Parse one credit into ``(name, description)``.
+
+    Handles the styles the CHANGELOG has actually used:
+    ``@user: did a thing``, ``@user, did a thing``, ``@user did a thing``
+    (no separator, the current prose style), and ``RedmineUP, provided ...``
+    for an organisation credited by name rather than by handle. The separator
+    set keeps the em and en dashes so older entries still parse, even though
+    the writing rules no longer produce them.
+    """
+    handle = re.match(r"(@\S+?)[\s—–:,-]+(.+)", entry, re.DOTALL)
+    if handle:
+        return handle.group(1), handle.group(2).strip()
+
+    named = re.match(r"([A-Za-z][\w.\-]*)\s*[—–:,]\s*(.+)", entry, re.DOTALL)
+    if named:
+        return named.group(1), named.group(2).strip()
+
+    return None
+
+
 def _split_contributors(section: str) -> tuple[str, str]:
     """Split a changelog section into (main_body, acknowledgements).
 
     The ### Contributors subsection is removed from the body and reformatted
-    as an Acknowledgements block that matches the existing release style.
+    as a Contributors block that matches the existing release style.
     Contributor credits are NEVER rewritten by the LLM: keeping this
     deterministic preserves @-mentions and PR links verbatim.
     """
@@ -407,22 +524,25 @@ def _split_contributors(section: str) -> tuple[str, str]:
     # Build acknowledgements: group contributions by author
     contrib_text = contrib_match.group(1).strip()
     authors: dict[str, list[str]] = {}
-    for line in contrib_text.split("\n"):
-        line = line.strip()
-        if not line.startswith("- "):
-            continue
-        # Format: "- @username: description ([#PR](url))"
-        # Accept colon and comma (current styles, per the no-em-dash writing
-        # rule), as well as em dash / en dash / hyphen for older CHANGELOG
-        # entries.
-        author_match = re.match(r"-\s+(@\S+)\s*[—–\-:,]\s*(.*)", line)
-        if author_match:
-            author = author_match.group(1)
-            desc = author_match.group(2).strip()
+    for entry in _contributor_entries(contrib_text):
+        parsed = _parse_contributor_entry(entry)
+        if parsed:
+            author, desc = parsed
             authors.setdefault(author, []).append(desc)
 
     if not authors:
-        return body, ""
+        # Never return an empty block for a section that exists: stripping it
+        # from the body above has already removed the credits, so returning ""
+        # publishes a release with the contributors silently deleted. That has
+        # shipped three times now (v2.0.0 on the colon separator, v2.13.0 on a
+        # name with no @handle, v2.14.0 on a handle with no separator), so this
+        # fails the release instead.
+        raise ValueError(
+            "CHANGELOG has a '### Contributors' section but no entry could be "
+            "parsed, so the release would publish without credit. Entries must "
+            "be list items starting with '- '. Section content:\n"
+            f"{contrib_text}"
+        )
 
     ack_lines = []
     for author, contribs in authors.items():
@@ -440,7 +560,7 @@ def extract_changelog_section(project_root: Path, version: str) -> tuple[str, st
     Returns (main_body, acknowledgements). See _split_contributors.
     """
     changelog = project_root / "CHANGELOG.md"
-    content = changelog.read_text()
+    content = changelog.read_text(encoding="utf-8")
 
     pattern = rf"## \[{re.escape(version)}\][^\n]*\n(.*?)(?=\n## \[|\Z)"
     match = re.search(pattern, content, re.DOTALL)
@@ -457,7 +577,7 @@ def extract_unreleased_section(project_root: Path) -> tuple[str, str]:
     Returns (main_body, acknowledgements). Used before the version bump
     has rewritten [Unreleased] into a numbered section.
     """
-    content = (project_root / "CHANGELOG.md").read_text()
+    content = (project_root / "CHANGELOG.md").read_text(encoding="utf-8")
     match = re.search(
         r"## \[Unreleased\]\s*\n(.*?)(?=^## \[|\Z)",
         content,
@@ -488,29 +608,11 @@ def create_release_branch(new_version: str, dry_run: bool) -> str:
     return branch_name
 
 
-def bump_version(config: ReleaseConfig) -> tuple[str, str]:
-    """Update version in all files."""
-    print("\n=== Version Bump ===\n")
-
-    current_version = get_current_version(config.project_root)
-    new_version = calculate_new_version(current_version, config.bump_type)
-
-    print(f"Version: {current_version} -> {new_version}")
-    print()
-
-    update_pyproject_toml(config.project_root, new_version, config.dry_run)
-    update_server_json(config.project_root, new_version, config.dry_run)
-    update_changelog(config.project_root, new_version, config.dry_run)
-    update_uv_lock(config.project_root, config.dry_run)
-
-    return current_version, new_version
-
-
 def commit_version_bump(config: ReleaseConfig, new_version: str) -> None:
     """Commit version bump changes on release branch."""
     print("\n=== Commit Version Bump ===\n")
 
-    files = ["pyproject.toml", "server.json", "CHANGELOG.md", "uv.lock"]
+    files = ["pyproject.toml", "server.json", "CHANGELOG.md", "README.md", "uv.lock"]
     for f in files:
         run_command(
             ["git", "add", f],
@@ -575,8 +677,8 @@ def notes_file_path(project_root: Path, new_version: str) -> Path:
 
 
 def _ack_block(acknowledgements: str) -> str:
-    """Deterministic Acknowledgements block (contributor credits, verbatim)."""
-    return f"\n\n## Acknowledgements\n\n{acknowledgements}" if acknowledgements else ""
+    """Deterministic Contributors block (contributor credits, verbatim)."""
+    return f"\n\n## Contributors\n\n{acknowledgements}" if acknowledgements else ""
 
 
 def _install_and_links_section(new_version: str) -> str:
@@ -597,7 +699,7 @@ pip install {PACKAGE_NAME}=={new_version}
 def build_release_body(generated: str, acknowledgements: str, new_version: str) -> str:
     """Compose final notes: Claude-generated sections + deterministic tail.
 
-    Acknowledgements are appended verbatim (never LLM-rewritten) so
+    Contributor credits are appended verbatim (never LLM-rewritten) so
     contributor @-mentions and PR links are preserved exactly.
     """
     ack = _ack_block(acknowledgements)
@@ -624,6 +726,18 @@ NOTES_GENERATION_TIMEOUT = 120
 # Deny the tools `claude -p` could plausibly reach for (a pure text
 # transform needs none). The prompt also instructs it not to use tools.
 NOTES_DENIED_TOOLS = "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Task,TodoWrite"
+
+# Without these, every `claude -p` call also loads both CLAUDE.md files and
+# every configured MCP server's tool schemas on top of the prompt, which
+# dwarfs the changelog it is actually rewriting. No --system-prompt: a
+# custom one busts the shared cache prefix and bills more, not less.
+NOTES_CONTEXT_FLAGS = [
+    "--setting-sources",
+    "",
+    "--strict-mcp-config",
+    "--mcp-config",
+    '{"mcpServers":{}}',
+]
 
 # .format() template -- must contain no literal braces (a brace-containing
 # example added later would raise KeyError at release time). No em dashes in
@@ -653,7 +767,7 @@ Hard rules:
 - Keep every number exactly as written in the changelog.
 - Never use em dashes. Use a comma, colon, or hyphen instead.
 - Plain markdown only. No H1 headings. Do not add Installation, Links, or
-  Acknowledgements sections (they are appended separately).
+  Contributors sections (they are appended separately).
 
 Changelog section for {tag}:
 
@@ -694,7 +808,13 @@ def generate_release_notes(
 
     try:
         result = subprocess.run(
-            ["claude", "-p", "--disallowedTools", NOTES_DENIED_TOOLS],
+            [
+                "claude",
+                "-p",
+                "--disallowedTools",
+                NOTES_DENIED_TOOLS,
+                *NOTES_CONTEXT_FLAGS,
+            ],
             input=prompt,
             capture_output=True,
             text=True,
@@ -722,16 +842,54 @@ def generate_release_notes(
 
 def write_notes_file(path: Path, title: str, body: str) -> None:
     """Persist approved notes; first line is an invisible title comment."""
-    path.write_text(f"<!-- title: {title} -->\n{body.strip()}\n")
+    path.write_text(f"<!-- title: {title} -->\n{body.strip()}\n", encoding="utf-8")
 
 
 def read_notes_file(path: Path) -> tuple[str | None, str]:
     """Read persisted notes back. Returns (title or None, body)."""
-    content = path.read_text()
+    content = path.read_text(encoding="utf-8")
     match = re.match(r"<!-- title: (.*?) -->\n", content)
     if match:
         return match.group(1), content[match.end() :].strip()
     return None, content.strip()
+
+
+class NotesFileError(ValueError):
+    """A pre-written notes file cannot be published for this version."""
+
+
+def load_approved_notes(
+    path: Path, new_version: str, acknowledgements: str
+) -> tuple[str, str]:
+    """Validate a maintainer-approved notes file; return (title, body).
+
+    Runs before anything is branched or tagged, so a wrong file stops the
+    release while it is still free to stop. The checks catch the two ways a
+    hand-edited or reused draft goes wrong: it was drafted for another
+    version (a patch/minor mix-up, or a leftover from a burned version), or
+    editing dropped a contributor credit.
+    """
+    tag = f"v{new_version}"
+    if not path.is_file():
+        raise NotesFileError(f"notes file not found: {path}")
+    title, body = read_notes_file(path)
+    if not body:
+        raise NotesFileError(f"notes file {path} has an empty body")
+    if title is None or not (title == tag or title.startswith(f"{tag}:")):
+        raise NotesFileError(
+            f"notes file {path} is titled {title!r}; this release is {tag}. "
+            f"The first line must be `<!-- title: {tag}: <headline> -->`."
+        )
+    missing = [
+        name
+        for name in re.findall(r"^Thanks to \*\*(.+?)\*\*", acknowledgements, re.M)
+        if name not in body
+    ]
+    if missing:
+        raise NotesFileError(
+            f"notes file {path} drops contributor credits: {', '.join(missing)}"
+        )
+    return title, body
 
 
 def _edit_notes_in_editor(path: Path) -> None:
@@ -752,7 +910,8 @@ def approve_release_notes(
     [r]egenerate with optional steering / [f]allback to raw changelog.
     Non-TTY: auto-accept the draft. Generation failure: prompt
     retry/fallback on a TTY, silent fallback otherwise. Never blocks the
-    release on the LLM. Acknowledgements are always appended deterministically.
+    release on the LLM. Contributor credits are always appended
+    deterministically.
     """
     tag = f"v{new_version}"
     interactive = sys.stdin.isatty()
@@ -833,9 +992,21 @@ def approve_release_notes(
             print("  Please answer y, e, r, or f.")
 
 
-def preview_release_notes(config: ReleaseConfig, new_version: str) -> None:
-    """Dry-run: draft real notes from [Unreleased] and print them."""
+def preview_release_notes(
+    config: ReleaseConfig, new_version: str, notes_path: Path
+) -> None:
+    """Dry-run: draft real notes from [Unreleased], print, and save them.
+
+    The draft lands at notes_path (gitignored) for the maintainer to edit in
+    any app; the real run then publishes it as approved instead of
+    regenerating. An existing draft is never overwritten: it may hold edits,
+    so delete it to get a fresh one.
+    """
     print("\n=== Release Notes (Preview) ===\n")
+    if notes_path.exists():
+        print(f"  [DRY-RUN] Keeping the existing draft at {notes_path}")
+        print("  [DRY-RUN] (delete it to generate a fresh one)")
+        return
     body, acknowledgements = extract_unreleased_section(config.project_root)
     try:
         title, generated = generate_release_notes(new_version, body)
@@ -847,6 +1018,9 @@ def preview_release_notes(config: ReleaseConfig, new_version: str) -> None:
     print(f"  [DRY-RUN] Title: {title}")
     print("  [DRY-RUN] Notes preview:\n")
     print(final)
+    write_notes_file(notes_path, title, final)
+    print(f"\n  ✓ Draft saved to {notes_path}")
+    print("    Edit it in any app; the real run publishes it as written.")
 
 
 def create_github_release(config: ReleaseConfig, new_version: str) -> None:
@@ -1188,6 +1362,12 @@ Examples:
   python scripts/release.py minor           # 0.12.1 -> 0.13.0
   python scripts/release.py major           # 0.12.1 -> 1.0.0
   python scripts/release.py patch --dry-run # Preview changes
+  python scripts/release.py --sync-contributors  # Refresh README credits only
+
+Release notes, edited outside the terminal:
+  python scripts/release.py minor --dry-run # saves release_notes_vX.Y.Z.md
+  # edit that file in any app, then:
+  python scripts/release.py minor           # publishes the edited draft
 
 Gitflow:
   develop -> release/vX.Y.Z -> master (tagged) -> merge back to develop
@@ -1203,15 +1383,43 @@ Gitflow:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Preview changes without executing",
+        help="Preview changes without executing; saves a release-notes draft",
     )
     parser.add_argument(
         "--hotfix",
         action="store_true",
         help="Finish the current hotfix/* branch (patch bump implied)",
     )
+    parser.add_argument(
+        "--notes-file",
+        type=Path,
+        help=(
+            "Publish this pre-approved notes file instead of generating one. "
+            "Defaults to the draft a --dry-run saved, when it exists."
+        ),
+    )
+    parser.add_argument(
+        "--sync-contributors",
+        action="store_true",
+        help=(
+            "Regenerate the README Contributors list from the CHANGELOG and "
+            "exit, without cutting a release"
+        ),
+    )
 
     args = parser.parse_args()
+
+    # Determine project root (parent of scripts directory)
+    project_root = Path(__file__).parent.parent.resolve()
+
+    # Standalone: keep the README credits current between releases, so a
+    # contributor credited in [Unreleased] does not wait for the next bump.
+    if args.sync_contributors:
+        if args.bump_type or args.hotfix:
+            parser.error("--sync-contributors cannot be combined with a release run")
+        print("\n=== Sync README Contributors ===\n")
+        update_readme_contributors(project_root, args.dry_run)
+        return
 
     # Validate: bump_type required unless --hotfix
     if args.hotfix:
@@ -1220,9 +1428,6 @@ Gitflow:
         parser.error("bump_type is required unless --hotfix is set")
     else:
         bump_type = args.bump_type
-
-    # Determine project root (parent of scripts directory)
-    project_root = Path(__file__).parent.parent.resolve()
 
     config = ReleaseConfig(
         bump_type=bump_type,
@@ -1245,6 +1450,20 @@ Gitflow:
     current_version = get_current_version(config.project_root)
     new_version = calculate_new_version(current_version, config.bump_type)
 
+    # Step 2b: A pre-approved notes file (explicit, or the draft a dry run
+    # saved) is validated now, before anything is branched or tagged.
+    notes_path = notes_file_path(config.project_root, new_version)
+    notes_source = args.notes_file or (notes_path if notes_path.exists() else None)
+    approved: tuple[str, str] | None = None
+    if notes_source is not None:
+        _, acknowledgements = extract_unreleased_section(config.project_root)
+        try:
+            approved = load_approved_notes(notes_source, new_version, acknowledgements)
+        except NotesFileError as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+        print(f"\nUsing approved release notes from {notes_source}")
+
     # Step 3: Create release branch (skipped in hotfix mode)
     if config.hotfix:
         result = run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"])
@@ -1264,6 +1483,7 @@ Gitflow:
     update_pyproject_toml(config.project_root, new_version, config.dry_run)
     update_server_json(config.project_root, new_version, config.dry_run)
     update_changelog(config.project_root, new_version, config.dry_run)
+    update_readme_contributors(config.project_root, config.dry_run)
     update_uv_lock(config.project_root, config.dry_run)
 
     # Step 5: Commit version bump on release branch
@@ -1271,9 +1491,16 @@ Gitflow:
 
     # Step 5b: Draft + approve release notes NOW, so the long unattended
     # waits (publish workflow, PyPI) happen after the human interaction.
-    notes_path = notes_file_path(config.project_root, new_version)
-    if config.dry_run:
-        preview_release_notes(config, new_version)
+    if approved is not None:
+        title, body = approved
+        print("\n=== Release Notes ===\n")
+        print(f"  Title: {title}")
+        if not config.dry_run:
+            # Normalise into the recovery path the later steps read.
+            write_notes_file(notes_path, title, body)
+        print(f"  ✓ Using approved notes from {notes_source}")
+    elif config.dry_run:
+        preview_release_notes(config, new_version, notes_path)
     else:
         print("\n=== Release Notes ===\n")
         body, acknowledgements = extract_changelog_section(

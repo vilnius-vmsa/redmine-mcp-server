@@ -9,7 +9,8 @@ import os
 import sys
 
 import pytest
-from unittest.mock import Mock, patch
+from redminelib.exceptions import ForbiddenError
+from unittest.mock import Mock, PropertyMock, patch
 
 # Add the src directory to the path so we can import our modules
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -1689,8 +1690,8 @@ class TestSearchEntireRedmineValidation:
         # Should have called search with default allowed types
         mock_redmine.search.assert_called_once()
         call_args = mock_redmine.search.call_args
-        # Resources should be the defaults: ["issues", "wiki_pages"]
-        assert set(call_args[1]["resources"]) == {"issues", "wiki_pages"}
+        # Resources should be the defaults
+        assert set(call_args[1]["resources"]) == {"issues", "wiki_pages", "news"}
 
     @pytest.mark.asyncio
     @patch("redmine_mcp_server._client.redmine")
@@ -1728,19 +1729,19 @@ class TestSearchEntireRedmineValidation:
             search_entire_redmine,
         )  # Return results with an unknown type that's not in allowed_types
 
-        mock_news = Mock()
-        mock_news.id = 1
-        mock_news.title = "News Item"
+        mock_project = Mock()
+        mock_project.id = 1
+        mock_project.name = "Some Project"
 
         mock_redmine.search.return_value = {
-            "news": [mock_news],  # Not in allowed_types
+            # Redmine searches projects; this server does not offer them.
+            "projects": [mock_project],
             "issues": [],
         }
 
         result = await search_entire_redmine("test query")
 
-        # "news" should not be in results_by_type
-        assert "news" not in result["results_by_type"]
+        assert "projects" not in result["results_by_type"]
         assert result["total_count"] == 0
 
 
@@ -2184,14 +2185,24 @@ class TestGetRedmineIssueIncludeFlags:
         w2 = Mock(id=11)
         w2.name = "Watcher Two"
         issue.watchers = [w1, w2]
-        issue.relations = [
-            Mock(
-                id=5,
-                issue_id=123,
-                issue_to_id=456,
-                relation_type="relates",
-            )
-        ]
+        # Relations come from the include=relations payload, as dicts.
+        # python-redmine's issue.relations attribute does NOT read that
+        # payload -- it is a lazy relation that issues a separate
+        # GET /issues/{id}/relations.json, mapped to manage_issue_relations.
+        # So serve them from raw() and make the attribute raise, so a
+        # regression to getattr fails here and not only against a real Redmine.
+        issue.raw.return_value = {
+            "relations": [
+                {
+                    "id": 5,
+                    "issue_id": 123,
+                    "issue_to_id": 456,
+                    "relation_type": "relates",
+                    "delay": None,
+                }
+            ]
+        }
+        type(issue).relations = PropertyMock(side_effect=ForbiddenError)
         issue.children = [
             Mock(
                 id=200,

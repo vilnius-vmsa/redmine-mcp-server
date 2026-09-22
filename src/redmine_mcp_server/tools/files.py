@@ -4,6 +4,7 @@ delete, attachment download URL generation, and cleanup of expired files.
 
 import base64
 import binascii
+import hashlib
 import io
 import json
 import os
@@ -16,8 +17,14 @@ from redminelib.exceptions import ResourceNotFoundError
 
 from .._cleanup import _ensure_cleanup_started
 from .._client import _get_redmine_client, logger
-from .._env import _admin_tools_enabled, _get_int_env, _is_read_only_mode
+from .._env import (
+    _admin_tools_enabled,
+    _get_int_env,
+    _get_upload_file_roots,
+    _is_read_only_mode,
+)
 from .._errors import _READ_ONLY_ERROR, _handle_redmine_error
+from .._offload import in_thread, offloaded
 from .._serialization import (
     _iter_capped,
     _named_ref,
@@ -26,6 +33,7 @@ from .._serialization import (
     wrap_insecure_content,
 )
 from .._ssrf import _download_file_url
+from .. import _upload_store
 from ..file_manager import AttachmentFileManager
 from ..server import mcp
 
@@ -33,10 +41,297 @@ from ..server import mcp
 # Module-level limits.
 # ---------------------------------------------------------------------------
 
-# Cap a single base64 file upload at ~50 MiB decoded to protect the server
-# from resource exhaustion. Larger files should be uploaded via a different
-# mechanism (e.g., writing to disk first and passing a path).
+# Cap a single file upload at ~50 MiB to protect the server from resource
+# exhaustion. Every source is measured against it: base64 after decoding,
+# file_path after reading, source_url from the declared length and again
+# while streaming.
 _FILE_UPLOAD_MAX_SIZE_BYTES = 50 * 1024 * 1024
+
+# Cap the number of attachments accepted in a single issue create/update call.
+_MAX_UPLOADS_PER_CALL = 10
+
+
+def _base64_max_bytes() -> int:
+    """Ceiling for a ``content_base64`` payload specifically.
+
+    Base64 is the one source whose bytes are written out by the model rather
+    than moved by a machine, and a long payload does not reliably survive that
+    (#305). Operators who would rather refuse a large one than risk a silently
+    corrupted attachment can lower this; unset, it is the ordinary upload cap,
+    so nothing that works today stops working.
+    """
+    try:
+        value = int(os.getenv("REDMINE_MCP_CONTENT_BASE64_MAX_BYTES", ""))
+    except ValueError:
+        return _FILE_UPLOAD_MAX_SIZE_BYTES
+    return value if value > 0 else _FILE_UPLOAD_MAX_SIZE_BYTES
+
+
+def _resolve_local_file(
+    file_path: str,
+) -> tuple[bytes, Optional[str], Optional[Dict[str, Any]]]:
+    """Read a local file for upload, gated by the configured allowlist roots.
+
+    Returns ``(content_bytes, basename, None)`` on success or
+    ``(b"", None, {"error": ...})`` on any validation failure.
+    """
+    resolved = os.path.realpath(file_path)
+    roots = _get_upload_file_roots()
+    allowed = False
+    for root in roots:
+        try:
+            if os.path.commonpath([resolved, root]) == root:
+                allowed = True
+                break
+        except ValueError:
+            # Different drives (Windows) or mixed abs/rel: not under this root.
+            continue
+    if not allowed:
+        return (
+            b"",
+            None,
+            {
+                "error": (
+                    "file_path is outside the allowed upload roots. It is "
+                    "read on the MCP server's own filesystem, not on the "
+                    "caller's: if the file is yours rather than the "
+                    "server's, send it as content_base64, or as a "
+                    "source_url the server can fetch, and no roots have to "
+                    "be configured at all. For a file that really does live "
+                    "on the server, the roots default to ATTACHMENTS_DIR "
+                    "and widen with the REDMINE_MCP_UPLOAD_FILE_ROOTS "
+                    "environment variable."
+                )
+            },
+        )
+    if os.path.isdir(resolved):
+        return b"", None, {"error": "file_path refers to a directory, not a file."}
+    if not os.path.isfile(resolved):
+        return b"", None, {"error": f"file_path does not exist: {file_path}"}
+    try:
+        with open(resolved, "rb") as fh:
+            content_bytes = fh.read()
+    except OSError as e:
+        return b"", None, {"error": f"Could not read file_path: {e}"}
+    if len(content_bytes) == 0:
+        return b"", None, {"error": "file_path content is empty."}
+    if len(content_bytes) > _FILE_UPLOAD_MAX_SIZE_BYTES:
+        size_mb = len(content_bytes) / (1024 * 1024)
+        limit_mb = _FILE_UPLOAD_MAX_SIZE_BYTES / (1024 * 1024)
+        return (
+            b"",
+            None,
+            {
+                "error": (
+                    f"File too large: {size_mb:.1f} MiB exceeds the "
+                    f"{limit_mb:.0f} MiB upload limit."
+                )
+            },
+        )
+    return content_bytes, os.path.basename(resolved), None
+
+
+async def _resolve_upload_content(
+    *,
+    filename: Optional[str],
+    content_base64: Optional[str] = None,
+    source_url: Optional[str] = None,
+    file_path: Optional[str] = None,
+    upload_id: Optional[str] = None,
+) -> tuple[bytes, Optional[str], Optional[Dict[str, Any]]]:
+    """Resolve exactly one of the four content sources to bytes.
+
+    Returns ``(content_bytes, final_filename, None)`` or
+    ``(b"", None, {"error": ...})``. Filename rules: content_base64 requires an
+    explicit ``filename``; source_url falls back to the fetch-inferred filename;
+    file_path falls back to the basename; upload_id falls back to the name the
+    ticket was created with. An explicit ``filename`` always wins.
+    """
+    sources = [s for s in (content_base64, source_url, file_path, upload_id) if s]
+    if len(sources) != 1:
+        return (
+            b"",
+            None,
+            {
+                "error": (
+                    "Provide exactly ONE of upload_id, content_base64, "
+                    "source_url, or file_path."
+                )
+            },
+        )
+
+    explicit = filename.strip() if filename and filename.strip() else None
+
+    if upload_id:
+        content_bytes, staged_name, staged_err = _upload_store.read_staged(upload_id)
+        if staged_err is not None:
+            return b"", None, staged_err
+        return content_bytes, explicit or staged_name, None
+
+    if source_url:
+        content_bytes, inferred, fetch_err = await _download_file_url(source_url)
+        if fetch_err is not None:
+            return b"", None, fetch_err
+        final = explicit or inferred
+        if not final:
+            return (
+                b"",
+                None,
+                {
+                    "error": (
+                        "Could not infer filename from source_url. Pass a filename."
+                    )
+                },
+            )
+        return content_bytes, final, None
+
+    if file_path:
+        content_bytes, basename, file_err = _resolve_local_file(file_path)
+        if file_err is not None:
+            return b"", None, file_err
+        return content_bytes, explicit or basename, None
+
+    # content_base64
+    if not explicit:
+        return b"", None, {"error": "filename is required when using content_base64."}
+    try:
+        content_bytes = base64.b64decode(content_base64, validate=True)
+    except (binascii.Error, ValueError) as e:
+        return (
+            b"",
+            None,
+            {"error": f"content_base64 is not valid base64. Details: {e}"},
+        )
+    if len(content_bytes) == 0:
+        return b"", None, {"error": "Decoded file content is empty."}
+    cap = _base64_max_bytes()
+    if len(content_bytes) > cap:
+        return (
+            b"",
+            None,
+            {
+                "error": (
+                    f"File too large for content_base64: "
+                    f"{len(content_bytes)} bytes exceeds the {cap}-byte "
+                    "limit for this source. Send it with create_upload_ticket "
+                    "and the upload_url instead -- the bytes go straight from "
+                    "disk to this server, so nothing has to be encoded into "
+                    "the conversation."
+                )
+            },
+        )
+    return content_bytes, explicit, None
+
+
+def _verify_integrity(
+    content_bytes: bytes,
+    expected_sha256: Optional[str],
+    expected_size: Optional[Any],
+) -> Optional[Dict[str, Any]]:
+    """Check a caller's claim about what it meant to send.
+
+    Only ``content_base64`` really needs this -- its bytes are written out by
+    the model, and a long payload does not reliably survive that (#305). A
+    checksum is 64 characters and survives what 4000 do not, so a corrupted
+    payload becomes an error instead of a silently broken attachment. The
+    check is offered on every source because a caller that can compute it may
+    as well have it verified.
+
+    Returns ``None`` when the claim holds or none was made.
+    """
+    if expected_size is not None:
+        try:
+            wanted = int(expected_size)
+        except (TypeError, ValueError):
+            return {"error": f"size_bytes is not a number: {expected_size!r}"}
+        if wanted != len(content_bytes):
+            return {
+                "error": (
+                    f"size_bytes mismatch: declared {wanted}, received "
+                    f"{len(content_bytes)}. The content did not arrive intact."
+                )
+            }
+
+    if expected_sha256:
+        if not isinstance(expected_sha256, str):
+            return {"error": "sha256 must be a hex string."}
+        wanted = expected_sha256.strip().lower()
+        actual = hashlib.sha256(content_bytes).hexdigest()
+        if wanted != actual:
+            return {
+                "error": (
+                    f"sha256 mismatch: declared {wanted}, received {actual}. "
+                    "The content did not arrive intact -- for a base64 payload "
+                    "this usually means it was truncated or garbled on the way "
+                    "in. Send the file with create_upload_ticket instead, which "
+                    "does not route the bytes through the conversation."
+                )
+            }
+
+    return None
+
+
+async def _build_upload_descriptors(
+    uploads: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Resolve and upload each entry, returning python-redmine upload descriptors.
+
+    Shared by issue and wiki write paths. Resolve and upload are interleaved per
+    entry so peak memory stays bounded to a single file. Returns
+    ``(descriptors, None)`` on success or ``([], {"error": ...})`` on the first
+    failing entry, before any resource is touched. Descriptor keys: token,
+    filename, and optional content_type / description.
+    """
+    if len(uploads) > _MAX_UPLOADS_PER_CALL:
+        return [], {
+            "error": (
+                f"Too many uploads: {len(uploads)} exceeds the limit of "
+                f"{_MAX_UPLOADS_PER_CALL} per call."
+            )
+        }
+
+    # Validate all entries are dicts before touching the client
+    for index, entry in enumerate(uploads):
+        if not isinstance(entry, dict):
+            return [], {"error": f"uploads[{index}] must be an object."}
+
+    # This helper interleaves async downloads with blocking uploads, so it
+    # cannot move to a worker wholesale like a tool body. Each blocking step
+    # gets its own hop instead (issue #216).
+    client = await in_thread(_get_redmine_client)
+    descriptors: List[Dict[str, Any]] = []
+    for index, entry in enumerate(uploads):
+        content_bytes, final_name, resolve_error = await _resolve_upload_content(
+            filename=entry.get("filename"),
+            content_base64=entry.get("content_base64"),
+            source_url=entry.get("source_url"),
+            file_path=entry.get("file_path"),
+            upload_id=entry.get("upload_id"),
+        )
+        if resolve_error is not None:
+            return [], {"error": f"uploads[{index}]: {resolve_error['error']}"}
+        integrity_error = _verify_integrity(
+            content_bytes, entry.get("sha256"), entry.get("size_bytes")
+        )
+        if integrity_error is not None:
+            return [], {"error": f"uploads[{index}]: {integrity_error['error']}"}
+        try:
+
+            def _upload() -> str:
+                return client.upload(io.BytesIO(content_bytes), filename=final_name)[
+                    "token"
+                ]
+
+            token = await in_thread(_upload)
+        except Exception as e:  # noqa: BLE001 - surfaced as an error dict
+            return [], {"error": f"uploads[{index}]: failed to upload. Details: {e}"}
+        descriptor: Dict[str, Any] = {"token": token, "filename": final_name}
+        if entry.get("content_type"):
+            descriptor["content_type"] = entry["content_type"]
+        if entry.get("description"):
+            descriptor["description"] = entry["description"]
+        descriptors.append(descriptor)
+    return descriptors, None
 
 
 def _file_to_dict(file_obj: Any) -> Dict[str, Any]:
@@ -67,6 +362,41 @@ def _file_to_dict(file_obj: Any) -> Dict[str, Any]:
 
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0"}
+
+
+def _public_base_url() -> Optional[str]:
+    """This server's externally reachable origin, or ``None`` when it has none.
+
+    An explicit ``PUBLIC_HOST`` always wins -- it is the operator saying the
+    server is reachable there, as in a Docker port-forward where localhost
+    really does work. Otherwise ``SERVER_HOST`` promotes only when it names
+    something other than a bind address (it is commonly ``0.0.0.0``, which is
+    not reachable as a URL). ``None`` means stdio-style deployment: there is
+    no URL to hand anyone, so callers fall back to a local file path.
+
+    Scheme: explicit ``PUBLIC_SCHEME`` wins; otherwise port 443 implies a
+    TLS-terminating proxy upstream (#252). Default ports are omitted so the
+    URL survives that proxy.
+    """
+    public_host_env = os.environ.get("PUBLIC_HOST")
+    server_host_env = os.environ.get("SERVER_HOST")
+    if public_host_env is not None:
+        public_host = public_host_env
+    elif server_host_env and server_host_env not in _LOOPBACK_HOSTS:
+        public_host = server_host_env
+    else:
+        return None
+
+    public_port = os.getenv("PUBLIC_PORT", os.getenv("SERVER_PORT", "8000"))
+    public_scheme = os.getenv("PUBLIC_SCHEME") or (
+        "https" if public_port == "443" else "http"
+    )
+    default_port = {"http": "80", "https": "443"}.get(public_scheme)
+    netloc = (
+        public_host if public_port == default_port else f"{public_host}:{public_port}"
+    )
+    return f"{public_scheme}://{netloc}"
+
 
 _ATTACHMENT_MAX_DOWNLOAD_BYTES_DEFAULT = 200 * 1024 * 1024  # 200 MB
 
@@ -106,154 +436,156 @@ async def get_redmine_attachment(
     """
     await _ensure_cleanup_started()
 
-    try:
-        client = _get_redmine_client()
+    def _run():
         try:
-            attachment = client.attachment.get(attachment_id)
-        except ResourceNotFoundError:
-            # Redmine's GET /attachments/{id}.json returns 404 in three
-            # situations and does not distinguish between them:
-            #   1. the attachment row truly does not exist;
-            #   2. the caller lacks view permission on the container
-            #      (Redmine collapses 403 -> 404 to avoid leaking
-            #      existence of attachments the user cannot see);
-            #   3. the underlying file is unreadable on the Redmine
-            #      server's filesystem (orphan metadata).
-            # The embed path used by get_redmine_issue(include_attachments)
-            # surfaces (3) and sometimes (2), which is why callers see
-            # the attachment via one tool but get "not found" here.
-            return {
-                "error": (
-                    f"Attachment {attachment_id} could not be fetched "
-                    f"from /attachments/{attachment_id}.json (HTTP 404)."
-                ),
-                "code": "ATTACHMENT_UNAVAILABLE",
-                "upstream_status": 404,
-                "hint": (
-                    "Redmine returns 404 here for missing attachments, "
-                    "for callers who lack view permission on the "
-                    "container, and for attachments whose underlying "
-                    "file is missing on the Redmine server's disk. If "
-                    "get_redmine_issue(include_attachments=True) lists "
-                    "this attachment, it exists but is either "
-                    "permission-restricted or orphaned on disk -- "
-                    "contact the Redmine administrator."
-                ),
-                "attachment_id": attachment_id,
-            }
-
-        # Sanitize filename: basename only (path traversal protection)
-        raw_filename = getattr(attachment, "filename", "") or ""
-        original_filename = os.path.basename(raw_filename)
-        if not original_filename:
-            original_filename = f"attachment_{attachment_id}"
-
-        content_type = getattr(attachment, "content_type", "application/octet-stream")
-        content_url = getattr(attachment, "content_url", "")
-
-        # Prepare UUID-based storage directory
-        attachments_dir = Path(os.getenv("ATTACHMENTS_DIR", "./attachments"))
-        attachments_dir.mkdir(parents=True, exist_ok=True)
-        file_id = str(uuid.uuid4())
-        uuid_dir = attachments_dir / file_id
-        uuid_dir.mkdir(exist_ok=True)
-
-        temp_path = uuid_dir / f"{original_filename}.tmp"
-        final_path = uuid_dir / original_filename
-
-        # Stream download with byte-cap abort
-        max_bytes = _get_int_env(
-            "ATTACHMENT_MAX_DOWNLOAD_BYTES",
-            _ATTACHMENT_MAX_DOWNLOAD_BYTES_DEFAULT,
-        )
-        response = client.download(content_url, savepath=None)
-
-        try:
-            byte_count = 0
-            with open(temp_path, "wb") as fh:
-                for chunk in response.iter_content(65536):
-                    byte_count += len(chunk)
-                    if byte_count > max_bytes:
-                        fh.close()
-                        _cleanup_uuid_dir(uuid_dir, temp_path)
-                        return {
-                            "error": (
-                                f"Attachment {attachment_id} exceeds the "
-                                f"{max_bytes}-byte download limit."
-                            )
-                        }
-                    fh.write(chunk)
-        except Exception:
-            _cleanup_uuid_dir(uuid_dir, temp_path)
-            raise
-
-        # Atomic rename: temp -> final
-        os.rename(str(temp_path), str(final_path))
-
-        # Write metadata for the cleanup manager
-        expires_minutes = float(os.getenv("ATTACHMENT_EXPIRES_MINUTES", "60"))
-        expires_at = datetime.now(timezone.utc) + timedelta(minutes=expires_minutes)
-        file_size = final_path.stat().st_size
-        absolute_path = str(final_path.resolve())
-
-        metadata = {
-            "file_id": file_id,
-            "attachment_id": attachment_id,
-            "original_filename": original_filename,
-            "file_path": absolute_path,
-            "content_type": content_type,
-            "size": file_size,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "expires_at": expires_at.isoformat(),
-        }
-        metadata_file = uuid_dir / "metadata.json"
-        temp_metadata = uuid_dir / "metadata.json.tmp"
-        try:
-            with open(temp_metadata, "w") as fh:
-                json.dump(metadata, fh, indent=2)
-            os.rename(str(temp_metadata), str(metadata_file))
-        except (OSError, IOError, ValueError) as exc:
+            client = _get_redmine_client()
             try:
-                if temp_metadata.exists():
-                    temp_metadata.unlink()
-                if final_path.exists():
-                    final_path.unlink()
-            except OSError:
-                pass
-            return {"error": f"Failed to save metadata: {exc}"}
+                attachment = client.attachment.get(attachment_id)
+            except ResourceNotFoundError:
+                # Redmine's GET /attachments/{id}.json returns 404 in three
+                # situations and does not distinguish between them:
+                #   1. the attachment row truly does not exist;
+                #   2. the caller lacks view permission on the container
+                #      (Redmine collapses 403 -> 404 to avoid leaking
+                #      existence of attachments the user cannot see);
+                #   3. the underlying file is unreadable on the Redmine
+                #      server's filesystem (orphan metadata).
+                # The embed path used by get_redmine_issue(include_attachments)
+                # surfaces (3) and sometimes (2), which is why callers see
+                # the attachment via one tool but get "not found" here.
+                return {
+                    "error": (
+                        f"Attachment {attachment_id} could not be fetched "
+                        f"from /attachments/{attachment_id}.json (HTTP 404)."
+                    ),
+                    "code": "ATTACHMENT_UNAVAILABLE",
+                    "upstream_status": 404,
+                    "hint": (
+                        "Redmine returns 404 here for missing attachments, "
+                        "for callers who lack view permission on the "
+                        "container, and for attachments whose underlying "
+                        "file is missing on the Redmine server's disk. If "
+                        "get_redmine_issue(include_attachments=True) lists "
+                        "this attachment, it exists but is either "
+                        "permission-restricted or orphaned on disk -- "
+                        "contact the Redmine administrator."
+                    ),
+                    "attachment_id": attachment_id,
+                }
 
-        # Mode detection:
-        # - Explicit PUBLIC_HOST always selects HTTP mode (respect user
-        #   intent, e.g. Docker port-forward where localhost is reachable
-        #   on the host).
-        # - Otherwise, SERVER_HOST promotes to HTTP mode only when it
-        #   names a non-loopback host (SERVER_HOST is the bind address
-        #   and is commonly "0.0.0.0", which is not reachable as a URL).
-        # - Otherwise, fall back to stdio/file mode.
-        public_host_env = os.environ.get("PUBLIC_HOST")
-        server_host_env = os.environ.get("SERVER_HOST")
-        if public_host_env is not None:
-            public_host = public_host_env
-            use_file_mode = False
-        elif server_host_env and server_host_env not in _LOOPBACK_HOSTS:
-            public_host = server_host_env
-            use_file_mode = False
-        else:
-            public_host = "localhost"
-            use_file_mode = True
+            # Sanitize filename: basename only (path traversal protection)
+            raw_filename = getattr(attachment, "filename", "") or ""
+            original_filename = os.path.basename(raw_filename)
+            if not original_filename:
+                original_filename = f"attachment_{attachment_id}"
 
-        public_port = os.getenv("PUBLIC_PORT", os.getenv("SERVER_PORT", "8000"))
+            content_type = getattr(
+                attachment, "content_type", "application/octet-stream"
+            )
+            content_url = getattr(attachment, "content_url", "")
 
-        expires_str = expires_at.isoformat()
-        # filename is structured metadata (used for paths, URLs,
-        # identifiers); not wrapped per #109. Path-traversal sanitization
-        # already ran above via os.path.basename().
-        safe_filename = original_filename
+            # Prepare UUID-based storage directory
+            attachments_dir = Path(os.getenv("ATTACHMENTS_DIR", "./attachments"))
+            attachments_dir.mkdir(parents=True, exist_ok=True)
+            file_id = str(uuid.uuid4())
+            uuid_dir = attachments_dir / file_id
+            uuid_dir.mkdir(exist_ok=True)
 
-        if use_file_mode:
-            return {
+            temp_path = uuid_dir / f"{original_filename}.tmp"
+            final_path = uuid_dir / original_filename
+
+            # Stream download with byte-cap abort
+            max_bytes = _get_int_env(
+                "ATTACHMENT_MAX_DOWNLOAD_BYTES",
+                _ATTACHMENT_MAX_DOWNLOAD_BYTES_DEFAULT,
+            )
+            response = client.download(content_url, savepath=None)
+
+            try:
+                byte_count = 0
+                with open(temp_path, "wb") as fh:
+                    for chunk in response.iter_content(65536):
+                        byte_count += len(chunk)
+                        if byte_count > max_bytes:
+                            fh.close()
+                            _cleanup_uuid_dir(uuid_dir, temp_path)
+                            return {
+                                "error": (
+                                    f"Attachment {attachment_id} exceeds the "
+                                    f"{max_bytes}-byte download limit."
+                                )
+                            }
+                        fh.write(chunk)
+            except Exception:
+                _cleanup_uuid_dir(uuid_dir, temp_path)
+                raise
+
+            # Atomic rename: temp -> final
+            os.rename(str(temp_path), str(final_path))
+
+            # Write metadata for the cleanup manager
+            expires_minutes = float(os.getenv("ATTACHMENT_EXPIRES_MINUTES", "60"))
+            expires_at = datetime.now(timezone.utc) + timedelta(minutes=expires_minutes)
+            file_size = final_path.stat().st_size
+            absolute_path = str(final_path.resolve())
+
+            metadata = {
+                "file_id": file_id,
+                "attachment_id": attachment_id,
+                "original_filename": original_filename,
                 "file_path": absolute_path,
-                "uri_type": "file",
+                "content_type": content_type,
+                "size": file_size,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "expires_at": expires_at.isoformat(),
+            }
+            metadata_file = uuid_dir / "metadata.json"
+            temp_metadata = uuid_dir / "metadata.json.tmp"
+            try:
+                with open(temp_metadata, "w", encoding="utf-8") as fh:
+                    json.dump(metadata, fh, indent=2)
+                os.rename(str(temp_metadata), str(metadata_file))
+            except (OSError, IOError, ValueError) as exc:
+                try:
+                    if temp_metadata.exists():
+                        temp_metadata.unlink()
+                    if final_path.exists():
+                        final_path.unlink()
+                except OSError:
+                    pass
+                return {"error": f"Failed to save metadata: {exc}"}
+
+            # Mode detection:
+            # - Explicit PUBLIC_HOST always selects HTTP mode (respect user
+            #   intent, e.g. Docker port-forward where localhost is reachable
+            #   on the host).
+            # - Otherwise, SERVER_HOST promotes to HTTP mode only when it
+            #   names a non-loopback host (SERVER_HOST is the bind address
+            #   and is commonly "0.0.0.0", which is not reachable as a URL).
+            # - Otherwise, fall back to stdio/file mode.
+            public_base = _public_base_url()
+            use_file_mode = public_base is None
+
+            expires_str = expires_at.isoformat()
+            # filename is structured metadata (used for paths, URLs,
+            # identifiers); not wrapped per #109. Path-traversal sanitization
+            # already ran above via os.path.basename().
+            safe_filename = original_filename
+
+            if use_file_mode:
+                return {
+                    "file_path": absolute_path,
+                    "uri_type": "file",
+                    "filename": safe_filename,
+                    "content_type": content_type,
+                    "size": file_size,
+                    "expires_at": expires_str,
+                    "attachment_id": attachment_id,
+                }
+
+            return {
+                "uri": f"{public_base}/files/{file_id}",
+                "uri_type": "http",
                 "filename": safe_filename,
                 "content_type": content_type,
                 "size": file_size,
@@ -261,22 +593,14 @@ async def get_redmine_attachment(
                 "attachment_id": attachment_id,
             }
 
-        return {
-            "uri": f"http://{public_host}:{public_port}/files/{file_id}",
-            "uri_type": "http",
-            "filename": safe_filename,
-            "content_type": content_type,
-            "size": file_size,
-            "expires_at": expires_str,
-            "attachment_id": attachment_id,
-        }
+        except Exception as exc:
+            return _handle_redmine_error(
+                exc,
+                f"downloading attachment {attachment_id}",
+                {"resource_type": "attachment", "resource_id": attachment_id},
+            )
 
-    except Exception as exc:
-        return _handle_redmine_error(
-            exc,
-            f"downloading attachment {attachment_id}",
-            {"resource_type": "attachment", "resource_id": attachment_id},
-        )
+    return await in_thread(_run)
 
 
 def _cleanup_uuid_dir(uuid_dir: Path, *extra_paths: Path) -> None:
@@ -295,7 +619,8 @@ def _cleanup_uuid_dir(uuid_dir: Path, *extra_paths: Path) -> None:
 
 
 @mcp.tool()
-async def list_files(
+@offloaded
+def list_files(
     project_id: Union[str, int],
 ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
     """List all files uploaded to a Redmine project.
@@ -344,27 +669,129 @@ async def list_files(
 
 
 @mcp.tool()
+async def create_upload_ticket(
+    filename: Optional[str] = None,
+    content_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Reserve a slot for a file on the caller's own machine, and say where to send it.
+
+    Use this whenever the file to attach lives on the caller's side. It is the
+    only route that does not put the file's bytes through the conversation:
+    there is no way to pipe a file into a tool argument, so a
+    ``content_base64`` payload is written out character by character by the
+    model, and a payload of a few thousand characters does not reliably
+    survive that (#305).
+
+    Three steps:
+
+    1. Call this. It answers with ``upload_url``, ``ticket`` and
+       ``expires_at``.
+    2. Send the file to ``upload_url`` in one HTTP request, with the ticket in
+       the ``X-Upload-Ticket`` header and the file as the body::
+
+           curl -sS -H "X-Upload-Ticket: TICKET" --data-binary @file.png URL
+
+       The response carries ``upload_id``, ``size`` and ``sha256``.
+       Multipart is deliberately not accepted: the whole body would be
+       buffered before its size could be checked.
+    3. Name that ``upload_id`` as the content source: in ``uploads`` on
+       ``create_redmine_issue`` / ``update_redmine_issue`` /
+       ``manage_redmine_wiki_page``, or on ``upload_file``.
+
+    The ticket is good for one upload, for a few minutes
+    (``REDMINE_MCP_UPLOAD_TICKET_MINUTES``, default 15), up to
+    ``max_bytes``. It authorises nothing else. The staged file is swept on
+    the same expiry as a downloaded attachment, so a failed attach can be
+    retried without sending the file again.
+
+    Returns:
+        ``{upload_url, upload_id, ticket, filename, expires_at, max_bytes}``,
+        or ``{"error": ...}`` when this server has no address a caller could
+        POST to -- a stdio-style deployment with neither ``PUBLIC_HOST`` nor a
+        routable ``SERVER_HOST``. There, a file the server can already read is
+        reachable through ``file_path`` instead.
+
+    Args:
+        filename: Name the attachment should get. Optional here and
+            overridable later, but passing it now keeps the staged file
+            recognisable.
+        content_type: Optional MIME type recorded with the staged file.
+    """
+    if _is_read_only_mode():
+        return dict(_READ_ONLY_ERROR)
+
+    base = _public_base_url()
+    if base is None:
+        return {
+            "error": (
+                "This server has no publicly reachable address configured "
+                "(PUBLIC_HOST, or a SERVER_HOST that is not a bind address), "
+                "so there is no upload_url to hand out. Attach the file with "
+                "file_path if the server can read it, or content_base64 if it "
+                "is small."
+            )
+        }
+
+    ticket = _upload_store.create_ticket(filename=filename, content_type=content_type)
+    await _ensure_cleanup_started()
+    return {
+        "upload_url": f"{base}/uploads/{ticket['upload_id']}",
+        **ticket,
+    }
+
+
+@mcp.tool()
 async def upload_file(
     project_id: Union[str, int],
     filename: Optional[str] = None,
+    upload_id: Optional[str] = None,
     content_base64: Optional[str] = None,
     source_url: Optional[str] = None,
+    file_path: Optional[str] = None,
+    sha256: Optional[str] = None,
+    size_bytes: Optional[int] = None,
     description: Optional[str] = None,
     version_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Upload a file to a Redmine project's Files section.
 
+    This is the project's document store, not an attachment on something.
+    To attach a file to an issue, pass ``uploads`` to
+    ``create_redmine_issue`` or ``update_redmine_issue``; to a wiki page,
+    to ``manage_redmine_wiki_page``. All three take the same content
+    sources as this tool.
+
     **Content sources — provide exactly ONE of:**
 
+    - ``upload_id``: a file already staged with ``create_upload_ticket``.
+      **The way to send a file that lives on the caller's own machine.**
+      The caller POSTs the bytes to the ticket's ``upload_url`` in one
+      HTTP request, so they travel from disk to this server directly and
+      are never written into a tool argument.
     - ``source_url``: an HTTP(S) URL the server will download from.
-      Use this when chaining with another MCP tool that returns a
-      download URL (e.g., a Google Drive MCP's
-      ``get_drive_file_download_url``), when the file is hosted on the
-      public web, or when the file is served by another local MCP
-      server over localhost. **Prefer this over content_base64** when a
-      URL is available — no need to download-then-re-encode.
-    - ``content_base64``: raw file bytes encoded as base64. Use this
-      only when the caller already has the file content in memory.
+      Preferred whenever the file is already reachable at one — chaining
+      from another MCP tool that returns a download URL, a file on the
+      public web — since it spares the caller the bytes entirely.
+    - ``content_base64``: raw file bytes encoded as base64. For content
+      the caller **generated** and that is small: a short CSV, an SVG, a
+      note. Not for a file on disk. There is no way to pipe a file into
+      a tool argument, so this payload is written out character by
+      character by the model, and a long one does not reliably survive
+      that (#305). Pass ``sha256`` with it.
+    - ``file_path``: a path read on **this server's own** filesystem,
+      inside ``ATTACHMENTS_DIR`` or a directory listed in
+      ``REDMINE_MCP_UPLOAD_FILE_ROOTS``. It reaches the caller's own
+      files only where the server runs on the caller's machine; against
+      a server on a different host a caller-side path cannot be read,
+      whatever the roots are set to.
+
+    **Integrity:** ``sha256`` and ``size_bytes`` are optional on any
+    source and are checked after the content is resolved, before
+    anything is sent to Redmine. They matter most for
+    ``content_base64``: 64 characters of checksum survive being copied
+    in a way a multi-kilobyte payload does not, so a mangled upload
+    fails loudly instead of attaching a corrupt file. Take them from the
+    same shell invocation that encoded the file.
 
     Under the hood this performs Redmine's standard two-step upload:
     ``POST /uploads.json`` to get a token, then
@@ -376,10 +803,18 @@ async def upload_file(
             Required when using ``content_base64``. Optional with
             ``source_url`` — if omitted, inferred from the URL path.
             Always prefer passing an explicit filename.
+        upload_id: A file staged with ``create_upload_ticket``. Mutually
+            exclusive with the other three sources.
         content_base64: File content encoded as a base64 string. Mutually
-            exclusive with ``source_url``.
+            exclusive with the other three sources.
         source_url: HTTP(S) URL to download the file from. Mutually
-            exclusive with ``content_base64``.
+            exclusive with the other three sources.
+        file_path: Path to a file on this server, inside ``ATTACHMENTS_DIR``
+            or a directory listed in ``REDMINE_MCP_UPLOAD_FILE_ROOTS``.
+            Mutually exclusive with the other three sources.
+        sha256: Optional hex digest of the file. Verified after the content
+            is resolved; a mismatch refuses the upload.
+        size_bytes: Optional byte count of the file, verified the same way.
         description: Optional human-readable description.
         version_id: Optional version/release ID to attach the file to
             (use ``list_redmine_versions`` to discover valid IDs).
@@ -401,118 +836,92 @@ async def upload_file(
         ...     description="Q2 report",
         ... )
 
-        >>> # From base64 content
-        >>> import base64
-        >>> content = base64.b64encode(b"Hello world").decode("ascii")
+        >>> # From a file on the caller's own machine
+        >>> ticket = await create_upload_ticket(filename="report.pdf")
+        >>> # the caller then sends the bytes itself, in one request:
+        >>> #   curl -H "X-Upload-Ticket: TICKET" --data-binary @report.pdf URL
+        >>> await upload_file(project_id="web", upload_id=ticket["upload_id"])
+
+        >>> # From generated content, with its checksum
+        >>> import base64, hashlib
+        >>> body = "id,name".encode("utf-8")
         >>> await upload_file(
         ...     project_id="web",
-        ...     filename="hello.txt",
-        ...     content_base64=content,
+        ...     filename="people.csv",
+        ...     content_base64=base64.b64encode(body).decode("ascii"),
+        ...     sha256=hashlib.sha256(body).hexdigest(),
         ... )
     """
     if _is_read_only_mode():
         return dict(_READ_ONLY_ERROR)
 
-    # Exactly one of content_base64 / source_url must be provided.
-    has_b64 = bool(content_base64)
-    has_url = bool(source_url)
-    if not has_b64 and not has_url:
-        return {"error": "Either content_base64 or source_url must be provided."}
-    if has_b64 and has_url:
-        return {
-            "error": ("Provide exactly ONE of content_base64 or source_url, not both.")
-        }
+    content_bytes, filename, resolve_error = await _resolve_upload_content(
+        filename=filename,
+        content_base64=content_base64,
+        source_url=source_url,
+        file_path=file_path,
+        upload_id=upload_id,
+    )
+    if resolve_error is not None:
+        return resolve_error
 
-    content_bytes: bytes
+    integrity_error = _verify_integrity(content_bytes, sha256, size_bytes)
+    if integrity_error is not None:
+        return integrity_error
 
-    if has_url:
-        content_bytes, inferred_filename, fetch_error = await _download_file_url(
-            source_url
-        )
-        if fetch_error is not None:
-            return fetch_error
-        # If caller didn't pass a filename, fall back to the URL-inferred one.
-        if not filename or not filename.strip():
-            filename = inferred_filename
-        if not filename:
-            return {
-                "error": (
-                    "Could not infer filename from source_url. "
-                    "Please pass a filename argument."
-                )
-            }
-    else:
-        if not filename or not filename.strip():
-            return {"error": "filename is required when using content_base64."}
-
-        # Decode and validate size before any network call
+    def _run():
+        client = _get_redmine_client()
         try:
-            content_bytes = base64.b64decode(content_base64, validate=True)
-        except (binascii.Error, ValueError) as e:
-            return {"error": f"content_base64 is not valid base64. Details: {e}"}
+            # Step 1: upload raw bytes to /uploads.json, get token
+            token = client.upload(io.BytesIO(content_bytes), filename=filename)["token"]
 
-        if len(content_bytes) == 0:
-            return {"error": "Decoded file content is empty."}
-
-        if len(content_bytes) > _FILE_UPLOAD_MAX_SIZE_BYTES:
-            size_mb = len(content_bytes) / (1024 * 1024)
-            limit_mb = _FILE_UPLOAD_MAX_SIZE_BYTES / (1024 * 1024)
-            return {
-                "error": (
-                    f"File too large: {size_mb:.1f} MiB exceeds the "
-                    f"{limit_mb:.0f} MiB upload limit."
-                )
+            # Step 2: create the File resource using the token
+            create_params: Dict[str, Any] = {
+                "project_id": project_id,
+                "token": token,
+                "filename": filename,
             }
+            if description is not None:
+                create_params["description"] = description
+            if version_id is not None:
+                create_params["version_id"] = version_id
 
-    client = _get_redmine_client()
-    try:
-        # Step 1: upload raw bytes to /uploads.json, get token
-        token = client.upload(io.BytesIO(content_bytes), filename=filename)["token"]
+            uploaded = client.file.create(**create_params)
 
-        # Step 2: create the File resource using the token
-        create_params: Dict[str, Any] = {
-            "project_id": project_id,
-            "token": token,
-            "filename": filename,
-        }
-        if description is not None:
-            create_params["description"] = description
-        if version_id is not None:
-            create_params["version_id"] = version_id
+            # Redmine returns HTTP 204 (empty body) on successful file creation,
+            # so python-redmine's FileManager synthesizes a minimal response that
+            # only contains the ID. Re-fetch the full attachment metadata so the
+            # caller gets filename, size, content type, author, etc.
+            uploaded_id = getattr(uploaded, "id", None)
+            if uploaded_id is not None:
+                try:
+                    full = client.attachment.get(uploaded_id)
+                    return _file_to_dict(full)
+                except Exception:
+                    # If re-fetch fails for any reason, fall back to the minimal
+                    # response + the known fields we already have.
+                    pass
+            result = _file_to_dict(uploaded)
+            # Fallback enrichment when the re-fetch failed: ensure the caller at
+            # least sees the filename and description they just uploaded.
+            if not result.get("filename"):
+                result["filename"] = filename
+            if description is not None and not result.get("description"):
+                result["description"] = description
+            return result
+        except Exception as e:
+            return _handle_redmine_error(
+                e,
+                f"uploading file '{filename}' to project {project_id}",
+                {"resource_type": "project", "resource_id": project_id},
+            )
 
-        uploaded = client.file.create(**create_params)
-
-        # Redmine returns HTTP 204 (empty body) on successful file creation,
-        # so python-redmine's FileManager synthesizes a minimal response that
-        # only contains the ID. Re-fetch the full attachment metadata so the
-        # caller gets filename, size, content type, author, etc.
-        uploaded_id = getattr(uploaded, "id", None)
-        if uploaded_id is not None:
-            try:
-                full = client.attachment.get(uploaded_id)
-                return _file_to_dict(full)
-            except Exception:
-                # If re-fetch fails for any reason, fall back to the minimal
-                # response + the known fields we already have.
-                pass
-        result = _file_to_dict(uploaded)
-        # Fallback enrichment when the re-fetch failed: ensure the caller at
-        # least sees the filename and description they just uploaded.
-        if not result.get("filename"):
-            result["filename"] = filename
-        if description is not None and not result.get("description"):
-            result["description"] = description
-        return result
-    except Exception as e:
-        return _handle_redmine_error(
-            e,
-            f"uploading file '{filename}' to project {project_id}",
-            {"resource_type": "project", "resource_id": project_id},
-        )
+    return await in_thread(_run)
 
 
 @mcp.tool()
-async def delete_file(
+@offloaded
+def delete_file(
     file_id: int,
     confirm_delete_any_attachment: bool = False,
 ) -> Dict[str, Any]:

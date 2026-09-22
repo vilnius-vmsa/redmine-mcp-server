@@ -15,11 +15,16 @@ tokens with the same introspection endpoint. In legacy mode the instance is
 built without ``auth=`` and behaves as before.
 """
 
+import logging
 import os
 
 from fastmcp import FastMCP
 
+from ._annotations import annotations_for
+from ._env import _is_scope_enforcement_enabled
 from ._tool_error_middleware import CleanValidationErrorMiddleware
+
+logger = logging.getLogger(__name__)
 
 REDMINE_AUTH_MODE = os.environ.get("REDMINE_AUTH_MODE", "legacy").lower()
 
@@ -39,10 +44,147 @@ def _select_auth_provider(auth_mode: str):
         from ._oauth_proxy import build_oauth_proxy
 
         return build_oauth_proxy()
+    if auth_mode == "api-key-login":
+        from ._api_key_login import build_api_key_login
+
+        return build_api_key_login()
     return None
+
+
+def refresh_advertised_scopes(auth_provider) -> None:
+    """Push the current advertised scope list back into the auth provider.
+
+    Every builder snapshots the list into the provider it returns, and
+    ``AUTH_PROVIDER`` is built while this module body runs -- before
+    ``main.py`` has imported the modules ``REDMINE_MCP_EXTENSIONS`` names.
+    So an extension's scopes reach ``advertised_scopes()`` but not the
+    served discovery documents unless the provider is told again. All three
+    providers read their list when ``get_routes()`` builds the HTTP app,
+    which is after extensions load, so one call is enough.
+
+    Each mode keeps the source its own builder used:
+    :func:`oauth_scopes.advertised_scopes` for the OAuth proxy (whose
+    ``valid_scopes`` is what it registers clients against) and
+    :func:`oauth_scopes.configured_advertised_scopes` for the remote
+    provider and for ``api-key-login`` (so ``REDMINE_MCP_SCOPES`` still
+    narrows both). ``None``, the legacy modes, has nothing to refresh.
+
+    Any other provider fails startup if an extension declared scopes to
+    advertise. Left alone it would keep the narrower snapshot, so the
+    discovery documents would omit those scopes and, in a mode that grants
+    from the same list, every tool requiring one would be denied with
+    nothing in the log to say why. A provider nothing was declared for has
+    nothing to lose and is left as it is.
+
+    Imported lazily for the same reason :func:`_select_auth_provider` is:
+    a legacy deployment should not pull in the OAuth machinery.
+    """
+    if auth_provider is None:
+        return
+
+    from ._auth import RedmineAuthProvider
+
+    if isinstance(auth_provider, RedmineAuthProvider):
+        from .oauth_scopes import configured_advertised_scopes
+
+        auth_provider.update_scopes_supported(configured_advertised_scopes())
+        return
+
+    from fastmcp.server.auth.oauth_proxy import OAuthProxy
+
+    if isinstance(auth_provider, OAuthProxy):
+        from .oauth_scopes import advertised_scopes
+
+        auth_provider.update_default_scopes(advertised_scopes())
+        return
+
+    from ._api_key_login import ApiKeyLoginProvider
+
+    if isinstance(auth_provider, ApiKeyLoginProvider):
+        from .oauth_scopes import configured_advertised_scopes
+
+        auth_provider.update_scopes_supported(configured_advertised_scopes())
+        return
+
+    from ._extension_registry import REGISTERED_EXTENSIONS
+
+    declared = sorted(
+        {
+            scope
+            for spec in REGISTERED_EXTENSIONS
+            for scope in (*spec.advertised_read_scopes, *spec.advertised_write_scopes)
+        }
+    )
+    if declared:
+        raise RuntimeError(
+            f"Extensions advertise scope(s) {', '.join(declared)}, but the auth "
+            f"provider is a {type(auth_provider).__name__}, which this server "
+            "does not know how to refresh. It would keep the scope list it was "
+            "built with, so discovery would omit these scopes and every tool "
+            "that requires one would be denied."
+        )
+
+
+def _register_middlewares(mcp_instance, auth_provider) -> None:
+    """Attach tool-boundary middlewares.
+
+    Extracted so tests can exercise the registration logic on a fresh
+    FastMCP instance without reloading this module.
+    """
+    mcp_instance.add_middleware(CleanValidationErrorMiddleware())
+    if auth_provider is None:
+        # Legacy modes carry no OAuth scopes; nothing to enforce.
+        return
+    if _is_scope_enforcement_enabled():
+        from ._scope_middleware import ScopeEnforcementMiddleware
+
+        mcp_instance.add_middleware(ScopeEnforcementMiddleware())
+    else:
+        logger.warning(
+            "OAuth scope enforcement is DISABLED "
+            "(REDMINE_OAUTH_SCOPE_ENFORCEMENT=off): any active token can "
+            "call any tool. Re-enable after tokens are re-consented with "
+            "the required scopes."
+        )
+
+    # After the scope check, so a call denied for scope never looks like a
+    # rejected Redmine key and never costs anyone their session. Imported
+    # inside the branch, matching _select_auth_provider: the other OAuth modes
+    # should not pull this module in either.
+    if REDMINE_AUTH_MODE == "api-key-login":
+        from ._api_key_login import ApiKeyLoginProvider, BindingRevocationMiddleware
+
+        if isinstance(auth_provider, ApiKeyLoginProvider):
+            mcp_instance.add_middleware(BindingRevocationMiddleware(auth_provider))
 
 
 AUTH_PROVIDER = _select_auth_provider(REDMINE_AUTH_MODE)
 
-mcp = FastMCP("redmine_mcp_tools", auth=AUTH_PROVIDER)
-mcp.add_middleware(CleanValidationErrorMiddleware())
+
+class _AnnotatingFastMCP(FastMCP):
+    """FastMCP that injects ToolAnnotations from the central table.
+
+    Every tool in this server registers with the deferred decorator form
+    (``@mcp.tool()`` or ``@mcp.tool(app=...)``), with no positional name and
+    no ``name=``, so the tool name is always ``fn.__name__``. A caller that
+    passes ``annotations=`` or a custom name bypasses the table rather than
+    fighting it.
+
+    An unclassified tool yields ``annotations=None``, which is exactly the
+    pre-#204 behavior. That fails safe: clients already treat an unannotated
+    tool as potentially destructive. The anti-drift test is what catches it.
+    """
+
+    def tool(self, name_or_fn=None, **kwargs):
+        if name_or_fn is not None or kwargs.get("name") or "annotations" in kwargs:
+            return super().tool(name_or_fn, **kwargs)
+        register = super().tool
+
+        def decorator(fn):
+            return register(annotations=annotations_for(fn.__name__), **kwargs)(fn)
+
+        return decorator
+
+
+mcp = _AnnotatingFastMCP("redmine_mcp_tools", auth=AUTH_PROVIDER)
+_register_middlewares(mcp, AUTH_PROVIDER)

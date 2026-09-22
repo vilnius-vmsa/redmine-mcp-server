@@ -11,6 +11,13 @@ from fastmcp import Client
 
 from redmine_mcp_server import server as _server  # noqa: F401
 from redmine_mcp_server import tools  # noqa: F401
+from redmine_mcp_server._env import SERVER_INFO_PLUGIN_FLAGS
+
+
+@pytest.fixture(autouse=True)
+def _full_surface(all_plugin_tools_visible):
+    """Enumerating tests must see every plugin tool (see conftest)."""
+    yield
 
 
 @pytest.mark.asyncio
@@ -33,7 +40,7 @@ async def test_returns_no_arg_schema():
         listed = {t.name: t for t in await client.list_tools()}
 
     assert "get_mcp_server_info" in listed
-    schema = listed["get_mcp_server_info"].inputSchema or {}
+    schema = listed["get_mcp_server_info"].input_schema or {}
     assert schema.get("properties", {}) == {}
     assert not schema.get("required")
 
@@ -60,8 +67,27 @@ async def test_reflects_plugin_flags(monkeypatch):
         "checklists",
         "products",
         "crm",
+        "deals",
         "dmsf",
+        "tags",
     }
+
+
+@pytest.mark.asyncio
+async def test_built_in_plugin_flags_are_the_table_extensions_are_held_to():
+    """An extension's family is merged into this same dict, and
+    register_extension refuses a family named after a built-in key by
+    consulting SERVER_INFO_PLUGIN_FLAGS. That only protects the response
+    while the response is built from the same table, in the same order.
+
+    Asserted as a prefix rather than as the whole key set, because a
+    deployment that loads an extension adds its families after these and
+    the guarantee being pinned is about the built-in half."""
+    async with Client(_server.mcp) as client:
+        result = await client.call_tool("get_mcp_server_info", {})
+
+    built_in = list(SERVER_INFO_PLUGIN_FLAGS)
+    assert list(result.data["plugin_flags"])[: len(built_in)] == built_in
 
 
 @pytest.mark.asyncio

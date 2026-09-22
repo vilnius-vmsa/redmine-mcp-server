@@ -34,18 +34,37 @@ This guide covers common issues and solutions for the Redmine MCP Server.
 ### Network Timeout Errors
 
 **Symptoms:**
-- Requests timing out
-- "Connection timeout" errors
+- "Redmine at ... did not respond in time"
+- "Timed out connecting to Redmine at ..."
 
 **Solutions:**
 
-1. **Increase Timeout Settings**
-   - Add longer timeout values in your configuration
-   - Check if Redmine server is slow or overloaded
+1. **Distinguish the two messages**
+   - "Timed out connecting" means the host or port never accepted the
+     connection. Check the URL, DNS, and any firewall or proxy in between.
+   - "did not respond in time" means Redmine accepted the connection but sent
+     no response within the read budget. The server is reachable but slow or
+     stuck.
 
-2. **Check Network Speed**
-   - Test your internet connection
-   - Consider using local network if possible
+2. **Raise the Limit for a Slow Redmine**
+   - `REDMINE_TIMEOUT` defaults to 30 seconds. Large queries against a busy
+     instance may legitimately need more: `REDMINE_TIMEOUT=120`.
+   - Setting `REDMINE_TIMEOUT=0` disables the timeout entirely. Avoid it: a
+     Redmine that accepts a connection and never answers will hang the
+     request forever.
+
+3. **Reduce the Work per Call**
+   - Lower `limit` on list tools, or use the `fields` parameter of
+     `list_redmine_issues` to return fewer fields.
+   - Use `journal_limit` on `get_redmine_issue` for issues with long
+     comment histories.
+
+**Note on large attachments:** the read timeout measures the gap between
+bytes, not total transfer time, so a slow but steady download is not cut off
+by it. An upload works the other way: after the file body is sent, the
+client still waits under the same read timeout for Redmine's response, so a
+large upload to a busy instance may need a higher `REDMINE_TIMEOUT` even
+though the transfer itself completed.
 
 ### SSL Certificate Errors
 
@@ -122,6 +141,10 @@ This guide covers common issues and solutions for the Redmine MCP Server.
    ```
 
    Disabling SSL verification makes your connection vulnerable to man-in-the-middle attacks. Never use in production.
+
+   The server pins this choice: when `REDMINE_SSL_VERIFY=false` or `REDMINE_SSL_CERT` is set, a CA bundle named by `REQUESTS_CA_BUNDLE` or `CURL_CA_BUNDLE` is ignored for Redmine connections, since it would otherwise override the setting. Proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) still apply, and the server logs a warning naming any of these variables it finds.
+
+   If verification still fails with `certificate verify failed` after disabling it, check whether an HTTPS proxy is in play: with `HTTPS_PROXY=https://...`, the proxy's own certificate is verified regardless of this setting, and the error is reported against the destination host. Point the proxy variable at an `http://` endpoint, or add the proxy's CA to the trust store on the machine running the server.
 
 5. **Certificate File Not Found**
 
@@ -288,6 +311,22 @@ This guide covers common issues and solutions for the Redmine MCP Server.
    - `"redmine": "unconfigured"` with `"status": "ok"`: `REDMINE_URL` or credentials are not set yet (not a runtime failure).
 
    The response is always HTTP 200 so orchestrators keep treating it as a binary liveness probe; inspect the JSON `status` field for the real state.
+
+### legacy-per-user: "Redmine did not accept this API key"
+
+**Symptoms:**
+- Tool calls fail with `code: PER_USER_AUTH` and "Redmine did not accept this API key (fingerprint ...abcd)"
+- Or, within 5 minutes of a key reset: reads return fewer projects than expected or "no issues", and writes fail with 403
+
+**Cause:** Redmine serves an unknown or reset key as the anonymous user on anything anonymous may read. The server checks each key once against `GET /users/current.json` and refuses it when Redmine answers 401. `/health` cannot catch this in `legacy-per-user` mode, because there is no shared key to probe with.
+
+**Solutions:**
+
+1. **Fix the key in the client.** Copy the current key from Redmine ("My account" → "API access key" → "Show") into the client's `X-Redmine-API-Key` header. The fingerprint in the error is the last four characters of the key the client sent.
+2. **Wait out the cache after a reset.** An accepted key is cached for 5 minutes, so a key reset in that window can still get the anonymous view until the entry expires. A rejected key is cached for 60 seconds, so a corrected key is picked up on the next request.
+3. **Remove the anonymous fallback.** Enable Administration → Settings → Authentication → "Authentication required" in Redmine. Redmine then answers any unrecognised key with 401 everywhere.
+
+A 403, 5xx, timeout, or connection error during the check never produces this message: the request goes ahead and the real error, if any, comes from the tool call itself. See [legacy-per-user auth](legacy-per-user-auth.md#key-validation) for details.
 
 ### Username/Password Authentication Failed
 
@@ -536,6 +575,68 @@ REDMINE_PUBLIC_URL=https://example.com/redmine
 4. **Verify the RedmineUP Agile plugin is installed**
    - Access your Redmine administration panel
    - Go to Administration → Plugins and confirm the Agile plugin is listed
+
+5. **OAuth modes: re-authorize so the token carries the agile scope**
+   - Under `oauth` / `oauth-proxy` the token must include the
+     `view_agile_queries` scope, or the agile endpoint returns 403 even when
+     the user's role grants Agile permissions.
+   - The server advertises this scope automatically when `REDMINE_AGILE_ENABLED=true`.
+     If you enabled the flag after already authorizing, your existing token
+     predates the scope: reconnect the MCP client so it runs a fresh OAuth flow
+     and consents to the updated scope list.
+
+### Tags Missing from Issue Results
+
+**Symptoms:**
+- `tags` is empty or absent in `get_redmine_issue` even though `REDMINE_TAGS_ENABLED=true` and the issue has tags in the web UI
+
+**Solutions:**
+
+1. **Verify `REDMINE_TAGS_ENABLED` is set correctly**
+   ```bash
+   # In .env file
+   REDMINE_TAGS_ENABLED=true
+   ```
+
+2. **Grant `view_issue_tags` to the user's role**
+   - Go to **Administration → Roles and permissions**
+   - Click the role assigned to your API user
+   - Under the **Issue tracking** section, check **View issue tags** and save
+   - The additional_tags plugin omits the `tags` field from the API entirely
+     when the caller lacks this permission, so the MCP returns `[]`.
+
+3. **Enable issue tags in the plugin settings**
+   - Go to **Administration → Plugins → Additional Tags → Configure**
+   - Confirm issue tagging (`active_issue_tags`) is enabled
+
+4. **Verify the additional_tags plugin is installed**
+   - Go to **Administration → Plugins** and confirm *Additional Tags* is listed
+
+5. **OAuth modes: re-authorize so the token carries the tags scopes**
+   - Under `oauth` / `oauth-proxy` the token must include `view_issue_tags`
+     (read) and, for writing, `create_issue_tags` / `edit_issue_tags`. The
+     server advertises these automatically when `REDMINE_TAGS_ENABLED=true`
+     (the write scopes are dropped in read-only mode). If you enabled the flag
+     after authorizing, reconnect the MCP client so it runs a fresh OAuth flow
+     and consents to the updated scope list.
+
+**Note:** tags are only *returned* by `get_redmine_issue` (single-issue fetch).
+The plugin injects them into `GET /issues/{id}.json` only, so `list_redmine_issues`
+and `search_redmine_issues` do not include a `tags` field.
+
+### Setting Tags Has No Effect (`tag_list` silently ignored)
+
+**Symptoms:**
+- Passing `tag_list` to `create_redmine_issue` / `update_redmine_issue` succeeds but the tags are not applied
+
+**Solutions:**
+
+1. **Confirm `REDMINE_TAGS_ENABLED=true`** — otherwise `tag_list` is silently dropped (like `story_points` without the agile flag).
+2. **Grant the write permission** — the role needs **Create issue tags** (to introduce brand-new tag names) or **Edit issue tags** (which only permits tags that already exist project-wide). With only *Edit issue tags*, new names are silently discarded by the plugin.
+3. **OAuth modes** — the token must carry `create_issue_tags` / `edit_issue_tags`; these are write scopes, so a read-only deployment (`REDMINE_MCP_READ_ONLY=true`) does not advertise them.
+4. **Custom field named `tag_list`** — `tag_list` is intercepted before custom-field resolution, so a custom field with that exact name can't be set by name; use the explicit `custom_fields` id form for it.
+
+**Note:** `tag_list` **replaces** the issue's entire tag set (it is not additive). Fetch the current tags with `get_redmine_issue` first if you want to add to them.
 
 ### Custom Field Named "story_points" Cannot Be Updated by Name
 
@@ -792,7 +893,7 @@ docker logs -f <container-id>
    ```
 2. If read-only is intentional (e.g., shared/demo instance), use only read tools:
    - `get_redmine_issue`, `list_redmine_issues`, `list_redmine_projects`, `search_redmine_issues`, `search_entire_redmine`, `manage_redmine_wiki_page(action="list"|"get")`, etc.
-3. Blocked tools in read-only mode: `create_redmine_issue`, `update_redmine_issue`, plus the write actions of every `manage_X` tool (e.g., `manage_redmine_wiki_page(action="create"|"update"|"delete"|"rename")`, `manage_issue_category(action="create"|"update"|"delete")`, `manage_project_member`, `manage_issue_watcher`, `manage_issue_note`, `manage_time_entry`, `manage_product(action="create"|"update")`, `manage_contact(action="create"|"update"|"delete"|"assign_to_project"|"remove_from_project")`). See [Read-Only Mode](./tool-reference.md#read-only-mode) in the tool reference for the full breakdown.
+3. Blocked tools in read-only mode: `create_redmine_issue`, `update_redmine_issue`, plus the write actions of every `manage_X` tool (e.g., `manage_redmine_wiki_page(action="create"|"update"|"delete"|"rename")`, `manage_issue_category(action="create"|"update"|"delete")`, `manage_project_member`, `manage_issue_watcher`, `manage_issue_note`, `manage_time_entry`, `manage_product(action="create"|"update")`, `manage_contact(action="create"|"update"|"delete"|"assign_to_project"|"remove_from_project")`, `manage_deal(action="create"|"update"|"delete")`). See [Read-Only Mode](./tool-reference.md#read-only-mode) in the tool reference for the full breakdown.
 
 #### "list_my_redmine_issues not found" / Import errors after upgrade
 
@@ -880,3 +981,65 @@ The v2.1+ release dropped several discovery path aliases. Only these paths remai
 In `REDMINE_AUTH_MODE=oauth-proxy`, the authorization-server metadata describes FastMCP's OAuthProxy endpoints instead.
 
 Clients should follow `WWW-Authenticate: Bearer resource_metadata="..."` headers from 401 responses (RFC 9728 §5.3) rather than guessing paths. If a client hardcodes the dropped variants, update the client; we don't plan to restore aliases.
+
+## api-key-login
+
+Setup, security model and session rules are in the [api-key-login guide](api-key-login-auth.md). The entries below cover what users and operators actually run into.
+
+### The server refuses to start
+
+**Symptoms:** startup fails with one of:
+- `Missing required env var: REDMINE_URL` or `Missing required env var: REDMINE_MCP_BASE_URL`
+- `Missing required secret env var: REDMINE_MCP_JWT_SIGNING_KEY or REDMINE_MCP_JWT_SIGNING_KEY_FILE.`
+- `REDMINE_MCP_BASE_URL must be https in api-key-login mode`
+- `REDMINE_API_KEY_LOGIN_SESSION_DAYS must be a positive number of days`
+
+**Solutions:** set the missing variable; serve the base URL over `https` (set `REDMINE_API_KEY_LOGIN_ALLOW_HTTP=true` only for local development); give the session length a positive number of days.
+
+### "This login page was opened in a different browser, or its cookie was blocked"
+
+**Cause:** a login only works in the browser the client opened, which receives a cookie when the login starts. The page refuses a browser without that cookie: a link copied into another browser, a private window, or a browser that blocks cookies for this site.
+
+**Solution:** allow cookies for the server's address and start the connection again from the client, so the same browser runs the whole login.
+
+### "Keys of Redmine administrators are not accepted here"
+
+**Cause:** keys of Redmine administrators are refused by default, because they bypass Redmine's permission checks.
+
+**Solution:** start the connection again from the client and log in with a second, non-administrative Redmine account; the refused login cannot be retried. Only if that is not an option, set `REDMINE_API_KEY_LOGIN_ALLOW_ADMIN=true`. See [Administrator accounts](api-key-login-auth.md#administrator-accounts).
+
+### "Redmine could not be reached" on the login page
+
+**Cause:** the server could not get an answer from `GET /users/current.json`: Redmine is down, `REDMINE_URL` is wrong, or a proxy redirected the request. The login attempt is not charged and the link stays valid for its 5 minutes.
+
+**Solution:** check that the server can reach `REDMINE_URL` (the `/health` endpoint probes it), then go back to the login page and press Connect again within its 5 minutes, or start again from the client.
+
+### "This login link is unknown or has expired"
+
+**Cause:** login links are valid for 5 minutes and allow 3 attempts; the link is also gone once a login succeeded.
+
+**Solution:** start the connection again from the client.
+
+### Client registration fails with "redirect_uri ... is not allowed by this server"
+
+**Cause:** the client's redirect URI is not on `REDMINE_MCP_ALLOWED_CLIENT_REDIRECT_URIS`. The default allows only loopback addresses, which local clients use.
+
+**Solution:** add the hosted client's exact redirect URI pattern to the allowlist. Avoid `*`: it removes the protection against crafted `/authorize` links described in the [security model](api-key-login-auth.md#security-model).
+
+### Everyone has to log in again after a deploy
+
+**Cause:** the store below `FASTMCP_HOME/api-key-login/` is not on a persistent volume, or `REDMINE_MCP_JWT_SIGNING_KEY` changed (a new key starts a new, empty store).
+
+**Solution:** check the `api-key-login state directory: ...` line in the startup log and make sure that path is on a volume. The Docker image sets `FASTMCP_HOME=/app/data/fastmcp`, which `docker-compose` mounts. Keep the signing key stable.
+
+### Tools return fewer results than expected, or "Redmine rejected the API key bound to this session"
+
+**Cause:** the user's API key was reset, or the account was locked, in Redmine. Redmine serves an unknown key as the anonymous user on anything anonymous may read, so until the session ends, reads can return the anonymous view. The session ends at the first call that gets a 401 (the tool then returns "Redmine rejected the API key bound to this session") or at the next token refresh, within an hour.
+
+**Solution:** nothing on the server. The client asks the user to log in again with the new key. To end sessions immediately after a reset, enable Administration → Settings → Authentication → "Authentication required" in Redmine.
+
+### Every user was signed out at once
+
+**Cause:** each token refresh checks the user's key with Redmine, and a 401 ends the session. A gateway or single-sign-on proxy in front of Redmine that answers 401 for its own reasons makes every check fail, so every session ends within an hour. A 403 or an unreachable Redmine does not end sessions.
+
+**Solution:** make sure `REDMINE_URL` reaches Redmine's API directly, or that the proxy passes `X-Redmine-API-Key` requests through.

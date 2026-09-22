@@ -1,6 +1,6 @@
 [project]
 name = "redmine-mcp-server"
-version = "2.4.0"
+version = "2.16.0"
 description = "MCP server that lets AI assistants manage Redmine issues, projects, wikis, and time tracking"
 readme = "README.md"
 license = {text = "MIT"}
@@ -25,6 +25,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Bug Tracking",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Office/Business :: Groupware",
@@ -32,14 +33,15 @@ classifiers = [
 dependencies = [
     "python-dotenv>=1.0.0,<2",
     "httpx>=0.27.0,<1",
-    "fastmcp>=3.0.0,<4",
+    "fastmcp>=4.0.1,<5",
     "python-redmine>=2.5.0,<3",
+    "requests>=2.31.0,<3",
     "starlette>=1.3.1,<2",
     "uvicorn>=0.24.0,<1",
     "python-multipart>=0.0.30,<1",
     "urllib3>=2.7.0,<3",
     "pyjwt[crypto]>=2.13.0,<3",
-    "cryptography>=48.0.1,<50",
+    "cryptography>=48.0.1,<51",
     "joserfc>=1.6.7,<2",
 ]
 
@@ -71,9 +73,18 @@ dev = [
     "pre-commit>=3.0.0,<5",
 ]
 
+[tool.uv]
+# Security floors for transitive dependencies (not imported directly). Drop each
+# entry once an upstream dependency raises its own floor past these versions.
+#   click < 8.3.3  -> PYSEC-2026-2132 (via uvicorn / rich-click stack)
+constraint-dependencies = ["click>=8.3.3"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/redmine_mcp_server"]
 
 [tool.coverage.report]
 exclude_lines = [

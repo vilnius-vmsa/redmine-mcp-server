@@ -1,12 +1,14 @@
-"""FastMCP v3 native auth provider factory for the Redmine MCP server.
+"""FastMCP native auth provider factory for the Redmine MCP server.
 
 Builds a RemoteAuthProvider that:
   - Validates opaque OAuth tokens via Doorkeeper RFC 7662 introspection
     (POST {REDMINE_URL}/oauth/introspect).
   - Mounts RFC 9728 protected-resource metadata at
     /.well-known/oauth-protected-resource/mcp.
-  - Advertises scopes_supported from oauth_scopes.advertised_scopes()
-    (filtered when REDMINE_MCP_READ_ONLY=true).
+  - Advertises scopes_supported from oauth_scopes.configured_advertised_scopes()
+    (filtered by REDMINE_MCP_READ_ONLY and REDMINE_MCP_SCOPES), refreshed
+    through update_scopes_supported() once the extension modules named by
+    REDMINE_MCP_EXTENSIONS have registered the scopes they add.
 
 The MCP server's introspection client_id/secret are read from
 REDMINE_INTROSPECT_CLIENT_ID / REDMINE_INTROSPECT_CLIENT_SECRET. The
@@ -30,8 +32,9 @@ import logging
 import os
 from urllib.parse import urlparse
 
-from ._env import require_introspection_credentials
-from .oauth_scopes import advertised_scopes
+from ._client import httpx_ssl_kwargs
+from ._env import require_introspection_credentials, _oauth_discovery_as
+from .oauth_scopes import configured_advertised_scopes
 
 logger = logging.getLogger(__name__)
 
@@ -47,24 +50,49 @@ class RedmineAuthProvider(RemoteAuthProvider):
         introspect_client_id: str,
         introspect_client_secret: str,
         scopes_supported: list[str],
+        discovery_as: str = "redmine",
     ):
         self.redmine_url = redmine_url
+        self.discovery_as = discovery_as
+        # In self-AS mode the MCP server is the authorization server that
+        # clients discover (issuer = base_url); authorize/token still target
+        # Redmine. In redmine mode the issuer names Redmine (post-#140).
+        issuer_source = base_url if discovery_as == "self" else str(redmine_url)
+        self.issuer = AnyHttpUrl(issuer_source)
         verifier = IntrospectionTokenVerifier(
             introspection_url=str(self.redmine_endpoint("/oauth/introspect")),
             client_id=introspect_client_id,
             client_secret=introspect_client_secret,
-            # required_scopes is intentionally unset: today we advertise scopes
-            # but do not gate tool calls on them. Per-tool scope enforcement is
-            # a follow-up roadmap item.
+            # required_scopes is intentionally unset: it would apply a
+            # global AND over every token. Per-tool enforcement lives in
+            # ScopeEnforcementMiddleware (#185).
         )
 
         super().__init__(
             token_verifier=verifier,
-            authorization_servers=[redmine_url],
+            authorization_servers=[self.issuer],
             base_url=base_url,
             scopes_supported=scopes_supported,
             resource_name="Redmine MCP Server",
         )
+
+    def update_scopes_supported(self, scopes: list[str]) -> None:
+        """Replace the scope list both discovery documents advertise.
+
+        The constructor snapshots ``configured_advertised_scopes()`` at the
+        moment ``server.py`` builds the provider, which is before
+        ``main.py`` has imported the modules ``REDMINE_MCP_EXTENSIONS``
+        names. An extension registered after that widens the advertised
+        list, and without this the served documents would keep the narrower
+        snapshot. FastMCP's ``OAuthProxy`` has
+        ``update_default_scopes`` for the same reason; this is the
+        ``RemoteAuthProvider`` shape of it.
+
+        Safe to call up to the point the HTTP app is built: both metadata
+        documents read :attr:`scopes_supported` when their routes are
+        created, which is what ``get_routes()`` does.
+        """
+        self._scopes_supported = list(scopes)
 
     def redmine_endpoint(self, path: str) -> AnyHttpUrl:
         """Build a Redmine OAuth endpoint URL from the configured Redmine URL."""
@@ -73,9 +101,15 @@ class RedmineAuthProvider(RemoteAuthProvider):
         )
 
     async def oauth_authorization_server(self, request: Request):
-        """RFC 8414 authorization-server metadata for Redmine Doorkeeper."""
+        """RFC 8414 authorization-server metadata for Redmine Doorkeeper.
+
+        Reads the ``scopes_supported`` property rather than the backing
+        attribute so this document and the protected-resource document --
+        which the base class builds from the same property -- cannot drift
+        apart once :meth:`update_scopes_supported` has replaced the list.
+        """
         metadata = OAuthMetadata(
-            issuer=self.redmine_url,
+            issuer=self.issuer,
             authorization_endpoint=self.redmine_endpoint("/oauth/authorize"),
             token_endpoint=self.redmine_endpoint("/oauth/token"),
             revocation_endpoint=self.redmine_endpoint("/oauth/revoke"),
@@ -89,7 +123,7 @@ class RedmineAuthProvider(RemoteAuthProvider):
                 "client_secret_post",
                 "client_secret_basic",
             ],
-            scopes_supported=self._scopes_supported,
+            scopes_supported=self.scopes_supported,
         )
         return await MetadataHandler(metadata).handle(request)
 
@@ -125,7 +159,7 @@ class RedmineAuthProvider(RemoteAuthProvider):
                 },
             )
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(**httpx_ssl_kwargs()) as client:
             try:
                 response = await client.post(
                     str(self.redmine_endpoint("/oauth/revoke")),
@@ -150,17 +184,28 @@ class RedmineAuthProvider(RemoteAuthProvider):
     def get_routes(self, mcp_path: str | None = None) -> list[Route]:
         routes = super().get_routes(mcp_path)
         base_path = urlparse(str(self.base_url)).path.rstrip("/")
-        metadata_path = f"{base_path}{mcp_path or ''}"
+        suffix_path = f"{base_path}{mcp_path or ''}"
 
-        routes.append(
-            Route(
-                f"/.well-known/oauth-authorization-server{metadata_path}",
-                endpoint=cors_middleware(
-                    self.oauth_authorization_server, ["GET", "OPTIONS"]
-                ),
-                methods=["GET", "OPTIONS"],
+        as_paths = [f"/.well-known/oauth-authorization-server{suffix_path}"]
+        if self.discovery_as == "self":
+            # RFC 8414 3.1 canonical location for issuer = base_url: insert the
+            # well-known suffix between host and the base path (root when the
+            # base URL has no path). Served in addition to the suffixed path so
+            # clients probing either location succeed.
+            canonical = f"/.well-known/oauth-authorization-server{base_path}"
+            if canonical not in as_paths:
+                as_paths.append(canonical)
+
+        for as_path in as_paths:
+            routes.append(
+                Route(
+                    as_path,
+                    endpoint=cors_middleware(
+                        self.oauth_authorization_server, ["GET", "OPTIONS"]
+                    ),
+                    methods=["GET", "OPTIONS"],
+                )
             )
-        )
         routes.append(Route("/revoke", self.revoke_token, methods=["POST"]))
         return routes
 
@@ -187,5 +232,6 @@ def build_remote_auth() -> RedmineAuthProvider:
         base_url=base_url,
         introspect_client_id=client_id,
         introspect_client_secret=client_secret,
-        scopes_supported=advertised_scopes(),
+        scopes_supported=configured_advertised_scopes(),
+        discovery_as=_oauth_discovery_as(),
     )
