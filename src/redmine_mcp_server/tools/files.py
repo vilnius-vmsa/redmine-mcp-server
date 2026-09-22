@@ -376,7 +376,8 @@ def _public_base_url() -> Optional[str]:
 
     Scheme: explicit ``PUBLIC_SCHEME`` wins; otherwise port 443 implies a
     TLS-terminating proxy upstream (#252). Default ports are omitted so the
-    URL survives that proxy.
+    URL survives that proxy. ``PUBLIC_BASE_PATH`` adds a reverse-proxy path
+    prefix, allowing several services to share one public hostname.
     """
     public_host_env = os.environ.get("PUBLIC_HOST")
     server_host_env = os.environ.get("SERVER_HOST")
@@ -395,7 +396,12 @@ def _public_base_url() -> Optional[str]:
     netloc = (
         public_host if public_port == default_port else f"{public_host}:{public_port}"
     )
-    return f"{public_scheme}://{netloc}"
+    base_path = os.getenv("PUBLIC_BASE_PATH", "").strip()
+    if base_path and base_path != "/":
+        base_path = "/" + base_path.strip("/")
+    else:
+        base_path = ""
+    return f"{public_scheme}://{netloc}{base_path}"
 
 
 _ATTACHMENT_MAX_DOWNLOAD_BYTES_DEFAULT = 200 * 1024 * 1024  # 200 MB

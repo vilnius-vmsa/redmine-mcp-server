@@ -431,6 +431,21 @@ class TestCreateUploadTicketTool:
         assert result["max_bytes"] > 0
 
     @pytest.mark.asyncio
+    async def test_public_base_path_prefixes_upload_url(
+        self, attachments_dir, monkeypatch
+    ):
+        monkeypatch.setenv("PUBLIC_HOST", "mcp.example.com")
+        monkeypatch.setenv("PUBLIC_PORT", "443")
+        monkeypatch.setenv("PUBLIC_BASE_PATH", "/redmine-mcp")
+        monkeypatch.delenv("REDMINE_MCP_READ_ONLY", raising=False)
+
+        result = await create_upload_ticket(filename="mockup.png")
+
+        assert result["upload_url"] == (
+            f"https://mcp.example.com/redmine-mcp/uploads/{result['upload_id']}"
+        )
+
+    @pytest.mark.asyncio
     async def test_without_a_public_address_it_says_so(
         self, attachments_dir, monkeypatch
     ):
