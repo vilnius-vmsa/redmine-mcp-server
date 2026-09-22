@@ -133,15 +133,13 @@ jobs:
           umask 077
           printf '%s\n' "$ENV_FILE" > .env
 
-      - name: Write runtime secret files
+      - name: Write runtime introspection secret file
         shell: bash
         env:
           INTROSPECT_CLIENT_SECRET: ${{ secrets.REDMINE_INTROSPECT_CLIENT_SECRET }}
-          MCP_JWT_SIGNING_KEY: ${{ secrets.REDMINE_MCP_JWT_SIGNING_KEY }}
         run: |
           set -euo pipefail
           test -n "$INTROSPECT_CLIENT_SECRET"
-          test -n "$MCP_JWT_SIGNING_KEY"
 
           # This directory is unique to this deployment and is removed after
           # the diagnostics step. Docker Compose copies each file into the
@@ -150,9 +148,7 @@ jobs:
           install -d -m 0700 "$secret_dir"
           umask 077
           printf '%s' "$INTROSPECT_CLIENT_SECRET" > "$secret_dir/redmine_introspect_client_secret"
-          printf '%s' "$MCP_JWT_SIGNING_KEY" > "$secret_dir/redmine_mcp_jwt_signing_key"
           echo "REDMINE_INTROSPECT_SECRET_PATH=$secret_dir/redmine_introspect_client_secret" >> "$GITHUB_ENV"
-          echo "REDMINE_MCP_JWT_SIGNING_KEY_PATH=$secret_dir/redmine_mcp_jwt_signing_key" >> "$GITHUB_ENV"
           echo "RUNTIME_SECRETS_DIR=$secret_dir" >> "$GITHUB_ENV"
 
       - name: Pull and deploy verified image
@@ -173,6 +169,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ -z "${REDMINE_INTROSPECT_SECRET_PATH:-}" ]]; then
+            echo "Skipping Compose logs: runtime introspection secret file was not created."
+            exit 0
+          fi
           docker compose -f docker-compose.production.yml logs --no-color --tail=200
 
       - name: Remove runtime secret files
@@ -189,5 +189,4 @@ jobs:
             exit 1
           fi
           rm -f "$RUNTIME_SECRETS_DIR/redmine_introspect_client_secret"
-          rm -f "$RUNTIME_SECRETS_DIR/redmine_mcp_jwt_signing_key"
           rmdir "$RUNTIME_SECRETS_DIR" 2>/dev/null || true

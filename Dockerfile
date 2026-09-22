@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_CACHE_DIR=/opt/uv-cache
 
 # Install uv package manager
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv@sha256:10787c682e4184e4f290de1171fd4703dc63de99221f10fe1c99002ce7fa9acc /uv /usr/local/bin/uv
 
 # Create and set working directory
 WORKDIR /app
