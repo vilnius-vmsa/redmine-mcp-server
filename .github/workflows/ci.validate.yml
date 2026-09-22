@@ -55,6 +55,5 @@ jobs:
           uv run flake8 src/ tests/ --max-line-length=88
       - name: Audit production dependencies
         run: |
-          uv tool run pip-audit --version
           uv export --no-hashes --no-emit-project > /tmp/requirements-audit.txt
           bash scripts/audit.sh -r /tmp/requirements-audit.txt --strict
