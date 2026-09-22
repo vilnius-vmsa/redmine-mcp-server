@@ -23,8 +23,10 @@ services:
       - redmine_introspect_client_secret
       - redmine_mcp_jwt_signing_key
     volumes:
-      - ./logs:/app/logs
-      - ./data:/app/data
+      # Named volumes inherit /app ownership from the image on first use,
+      # unlike host bind mounts, which may be owned by root.
+      - redmine_mcp_production_logs:/app/logs
+      - redmine_mcp_production_data:/app/data
     restart: unless-stopped
     networks:
       - redmine-mcp-network
@@ -38,6 +40,14 @@ services:
 networks:
   redmine-mcp-network:
     driver: bridge
+
+volumes:
+  # Explicit names survive a checkout-path or Compose project-name change.
+  # Do not remove the data volume: OAuthProxy stores encrypted state there.
+  redmine_mcp_production_logs:
+    name: redmine-mcp-production-logs
+  redmine_mcp_production_data:
+    name: redmine-mcp-production-data
 
 secrets:
   redmine_introspect_client_secret:

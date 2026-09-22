@@ -173,10 +173,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "${REDMINE_INTROSPECT_SECRET_PATH:-}" || -z "${REDMINE_MCP_JWT_SIGNING_KEY_PATH:-}" ]]; then
-            echo "Skipping Compose logs: runtime secret files were not created."
-            exit 0
-          fi
           docker compose -f docker-compose.production.yml logs --no-color --tail=200
 
       - name: Remove runtime secret files
