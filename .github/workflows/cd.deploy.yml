@@ -1,29 +1,15 @@
 name: "CD: Deploy"
 
 on:
-  repository_dispatch:
-    types: [deploy-production]
   workflow_dispatch:
     inputs:
-      image_ref:
-        description: Immutable ghcr.io image reference (image@sha256:digest).
+      image_tag:
+        description: Immutable promoted image tag (sha-<40-character commit SHA>).
         required: true
         type: string
-      build_sha:
-        description: Commit that produced the image.
-        required: true
-        type: string
-      branch:
-        description: Production source branch.
-        required: true
-        default: main
-        type: choice
-        options: [main]
 
 env:
-  IMAGE_REF: ${{ github.event.client_payload.image_ref || inputs.image_ref }}
-  BUILD_SHA: ${{ github.event.client_payload.build_sha || inputs.build_sha }}
-  DEPLOY_BRANCH: ${{ github.event.client_payload.branch || inputs.branch }}
+  IMAGE_TAG: ${{ inputs.image_tag }}
 
 concurrency:
   group: production-deployment
@@ -39,24 +25,19 @@ jobs:
     name: Resolve deploy environment
     runs-on: ubuntu-latest
     outputs:
+      build_sha: ${{ steps.validate.outputs.build_sha }}
       env_var: ${{ steps.environment.outputs.env_var }}
     steps:
       - name: Validate deployment inputs
+        id: validate
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! "$IMAGE_REF" =~ ^ghcr\.io/[a-z0-9][a-z0-9._/-]*@sha256:[a-f0-9]{64}$ ]]; then
-            echo "IMAGE_REF must be an immutable lowercase ghcr.io digest." >&2
+          if [[ ! "$IMAGE_TAG" =~ ^sha-[a-f0-9]{40}$ ]]; then
+            echo "IMAGE_TAG must be an immutable sha-<commit> tag." >&2
             exit 1
           fi
-          if [[ ! "$BUILD_SHA" =~ ^[a-f0-9]{40}$ ]]; then
-            echo "BUILD_SHA must be a full commit SHA." >&2
-            exit 1
-          fi
-          if [ "$DEPLOY_BRANCH" != main ]; then
-            echo "Only main may deploy to production." >&2
-            exit 1
-          fi
+          echo "build_sha=${IMAGE_TAG#sha-}" >> "$GITHUB_OUTPUT"
 
       - name: Determine environment
         id: environment
@@ -66,11 +47,15 @@ jobs:
           echo "env_var=production" >> "$GITHUB_OUTPUT"
 
   deploy:
-    name: Deploy to ${{ env.DEPLOY_BRANCH }} (${{ needs.set_env.outputs.env_var }})
+    name: Deploy production image
     needs: set_env
     runs-on: mcp
     environment: ${{ needs.set_env.outputs.env_var }}
     timeout-minutes: 20
+    env:
+      BUILD_SHA: ${{ needs.set_env.outputs.build_sha }}
+      DEPLOY_BRANCH: main
+      IMAGE_NAME: ghcr.io/${{ github.repository }}-${{ needs.set_env.outputs.env_var }}
     steps:
 
       - name: Check out deployment configuration
@@ -97,6 +82,20 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Resolve immutable image digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect "${IMAGE_NAME}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
+          if [[ ! "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "Unable to resolve a digest for ${IMAGE_NAME}:${IMAGE_TAG}." >&2
+            exit 1
+          fi
+          echo "IMAGE_REF=${IMAGE_NAME}@${digest}" >> "$GITHUB_ENV"
 
       - name: Verify image provenance
         shell: bash

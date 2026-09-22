@@ -79,6 +79,12 @@ dev = [
 #   click < 8.3.3  -> PYSEC-2026-2132 (via uvicorn / rich-click stack)
 constraint-dependencies = ["click>=8.3.3"]
 
+[tool.black]
+# CI and the production image run Python 3.13. Pin Black's grammar target so
+# its AST safety check does not infer a newer Python version from its own release.
+target-version = ["py313"]
+line-length = 88
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
