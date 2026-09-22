@@ -8,7 +8,6 @@ byte-for-byte on the way into ``uploads``.
 
 import hashlib
 import json
-import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
