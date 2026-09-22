@@ -14,14 +14,11 @@ services:
       # get_secret() then falls back to the corresponding *_FILE value.
       REDMINE_INTROSPECT_CLIENT_SECRET: ""
       REDMINE_INTROSPECT_CLIENT_SECRET_FILE: /run/secrets/redmine_introspect_client_secret
-      REDMINE_MCP_JWT_SIGNING_KEY: ""
-      REDMINE_MCP_JWT_SIGNING_KEY_FILE: /run/secrets/redmine_mcp_jwt_signing_key
-    # Production credentials are files, not container environment variables.
+    # The production credential is a file, not a container environment variable.
     # The manual deploy workflow creates these files from GitHub Environment
     # secrets immediately before `docker compose up`.
     secrets:
       - redmine_introspect_client_secret
-      - redmine_mcp_jwt_signing_key
     volumes:
       # Named volumes inherit /app ownership from the image on first use,
       # unlike host bind mounts, which may be owned by root.
@@ -43,7 +40,8 @@ networks:
 
 volumes:
   # Explicit names survive a checkout-path or Compose project-name change.
-  # Do not remove the data volume: OAuthProxy stores encrypted state there.
+  # Preserve the data volume; it may contain runtime state from an earlier
+  # OAuthProxy deployment. Direct OAuth does not require it for client state.
   redmine_mcp_production_logs:
     name: redmine-mcp-production-logs
   redmine_mcp_production_data:
@@ -52,5 +50,3 @@ volumes:
 secrets:
   redmine_introspect_client_secret:
     file: "${REDMINE_INTROSPECT_SECRET_PATH:?Set REDMINE_INTROSPECT_SECRET_PATH to the runtime secret file}"
-  redmine_mcp_jwt_signing_key:
-    file: "${REDMINE_MCP_JWT_SIGNING_KEY_PATH:?Set REDMINE_MCP_JWT_SIGNING_KEY_PATH to the runtime secret file}"
