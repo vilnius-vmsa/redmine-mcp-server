@@ -5,8 +5,12 @@ This module contains integration tests that test the actual connection
 to Redmine and the overall functionality of the MCP server.
 """
 
+import base64
+import json
 import os
+import re
 import sys
+from urllib.parse import quote
 
 import pytest
 
@@ -14,18 +18,48 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from redmine_mcp_server._client import (  # noqa: E402
+    _build_requests_config,
     _get_redmine_client,
+    REDMINE_API_KEY,
+    REDMINE_PASSWORD,
     REDMINE_URL,
+    REDMINE_USERNAME,
 )
 from redmine_mcp_server.tools.time_tracking import (  # noqa: E402
     list_time_entry_activities,
 )
 
+_INSECURE_CONTENT_PATTERN = re.compile(
+    r"^<insecure-content-([0-9a-f]{16})>\n(.*)\n</insecure-content-\1>$",
+    re.DOTALL,
+)
+
+
+def _unwrap_insecure_content(value):
+    """Strip the wrap_insecure_content() boundary tag, if present.
+
+    wrap_insecure_content() mints a fresh random nonce on every call, so
+    two separately-serialized responses carrying the same underlying text
+    will not be equal as raw strings. Compare the inner content instead.
+    Returns the value unchanged if it is not boundary-wrapped.
+    """
+    match = _INSECURE_CONTENT_PATTERN.match(value)
+    return match.group(2) if match else value
+
 
 def _get_redmine_or_none():
-    """Try to get a Redmine client, return None if not configured."""
+    """Try to get a Redmine client, return None if not configured.
+
+    ``allow_loop_thread()`` because this is a direct factory call from async
+    tests, not a tool call. Without it the event-loop guard (issue #216) raises
+    RuntimeError, which the ``except`` below would read as "not configured" and
+    silently skip the test instead of running it.
+    """
+    from redmine_mcp_server._client import allow_loop_thread
+
     try:
-        return _get_redmine_client()
+        with allow_loop_thread():
+            return _get_redmine_client()
     except RuntimeError:
         return None
 
@@ -436,6 +470,120 @@ class TestRedmineIntegration:
     @pytest.mark.skipif(not REDMINE_URL, reason="REDMINE_URL not configured")
     @pytest.mark.integration
     @pytest.mark.asyncio
+    async def test_wiki_page_hierarchy_integration(self):
+        """Live round trip for the wiki page parent (issue #270).
+
+        Creates a parent and a child, reparents, and clears the parent
+        back to the wiki root, asserting what Redmine actually reports
+        at each step rather than what was sent.
+        """
+        redmine = _get_redmine_or_none()
+        if redmine is None:
+            pytest.skip("Redmine client not initialized")
+
+        from redmine_mcp_server.tools.wiki import manage_redmine_wiki_page
+
+        projects = list(redmine.project.all())
+        if not projects:
+            pytest.skip("No projects available for testing")
+
+        project_id = projects[0].identifier
+        parent_title = "Integration_Test_Wiki_Parent"
+        other_parent_title = "Integration_Test_Wiki_Parent_Two"
+        child_title = "Integration_Test_Wiki_Child"
+
+        async def _delete(title):
+            try:
+                await manage_redmine_wiki_page(
+                    action="delete", project_id=project_id, wiki_page_title=title
+                )
+            except Exception:
+                pass  # Best effort cleanup
+
+        try:
+            for title in (parent_title, other_parent_title):
+                created = await manage_redmine_wiki_page(
+                    action="create",
+                    project_id=project_id,
+                    wiki_page_title=title,
+                    text="Parent page for the hierarchy integration test.",
+                )
+                if "error" in created:
+                    if any(
+                        word in created["error"].lower()
+                        for word in ("denied", "permission", "forbidden")
+                    ):
+                        pytest.skip(f"Wiki editing not permitted: {created['error']}")
+                    pytest.fail(f"Failed to create parent: {created['error']}")
+                # A page at the root must not claim a parent.
+                assert "parent_title" not in created
+
+            # 1. Create a child underneath the first parent.
+            child = await manage_redmine_wiki_page(
+                action="create",
+                project_id=project_id,
+                wiki_page_title=child_title,
+                text="Child page.",
+                parent_title=parent_title,
+            )
+            if "error" in child:
+                pytest.fail(f"Failed to create child page: {child['error']}")
+            assert child["parent_title"] == parent_title
+
+            # 2. A get reports the parent too, not just the create echo.
+            fetched = await manage_redmine_wiki_page(
+                action="get", project_id=project_id, wiki_page_title=child_title
+            )
+            assert fetched["parent_title"] == parent_title
+
+            # 3. A text-only update must leave the parent alone.
+            untouched = await manage_redmine_wiki_page(
+                action="update",
+                project_id=project_id,
+                wiki_page_title=child_title,
+                text="Child page, edited without naming a parent.",
+            )
+            assert untouched["parent_title"] == parent_title
+
+            # 4. Reparent to the second parent.
+            moved = await manage_redmine_wiki_page(
+                action="update",
+                project_id=project_id,
+                wiki_page_title=child_title,
+                text="Child page, moved.",
+                parent_title=other_parent_title,
+            )
+            assert moved["parent_title"] == other_parent_title
+
+            # 5. An empty parent_title returns the page to the wiki root.
+            rooted = await manage_redmine_wiki_page(
+                action="update",
+                project_id=project_id,
+                wiki_page_title=child_title,
+                text="Child page, back at the root.",
+                parent_title="",
+            )
+            assert "parent_title" not in rooted
+
+            # 6. An unknown parent fails with an explanation, not a blank.
+            orphaned = await manage_redmine_wiki_page(
+                action="update",
+                project_id=project_id,
+                wiki_page_title=child_title,
+                text="Child page.",
+                parent_title="Integration_Test_No_Such_Parent",
+            )
+            assert "error" in orphaned
+            assert "Integration_Test_No_Such_Parent" in orphaned["error"]
+
+        finally:
+            # Children first: Redmine refuses to leave pages stranded.
+            for title in (child_title, parent_title, other_parent_title):
+                await _delete(title)
+
+    @pytest.mark.skipif(not REDMINE_URL, reason="REDMINE_URL not configured")
+    @pytest.mark.integration
+    @pytest.mark.asyncio
     async def test_wiki_page_lifecycle_integration(self):
         """Integration test for creating, updating, and deleting a wiki page."""
         redmine = _get_redmine_or_none()
@@ -452,6 +600,7 @@ class TestRedmineIntegration:
 
         project_id = projects[0].identifier
         wiki_title = "Integration_Test_Wiki_Page"
+        renamed_title = "Integration_Test_Wiki_Page_Renamed"
 
         try:
             # 1. Create a new wiki page
@@ -502,24 +651,48 @@ class TestRedmineIntegration:
             assert "Updated" in update_result["text"]
             assert update_result["version"] >= 2  # Version should increment
 
-            # 4. Delete the wiki page
+            # 4. Rename the wiki page
+            rename_result = await manage_redmine_wiki_page(
+                action="rename",
+                project_id=project_id,
+                wiki_page_title=wiki_title,
+                new_title=renamed_title,
+            )
+
+            if "error" in rename_result:
+                pytest.fail(f"Failed to rename wiki page: {rename_result['error']}")
+
+            assert rename_result["success"] is True
+            assert rename_result["title"] == renamed_title
+
+            # Redmine 7.0+ returns a project ref (Redmine #43569); older
+            # versions omit the key. Where present it must carry the real
+            # id/name rather than being blanked out during serialization.
+            # Covers every action that serializes a page.
+            for result in (create_result, read_result, update_result, rename_result):
+                project = result.get("project")
+                if project is not None:
+                    assert project["id"], f"project id missing: {project}"
+                    assert project["name"], f"project name missing: {project}"
+
+            # 5. Delete the wiki page
             delete_result = await manage_redmine_wiki_page(
                 action="delete",
                 project_id=project_id,
-                wiki_page_title=wiki_title,
+                wiki_page_title=renamed_title,
             )
 
             if "error" in delete_result:
                 pytest.fail(f"Failed to delete wiki page: {delete_result['error']}")
 
             assert delete_result["success"] is True
-            assert delete_result["title"] == wiki_title
+            assert delete_result["title"] == renamed_title
 
-            # 5. Verify the page was deleted
+            # 6. Verify the page was deleted
             verify_result = await manage_redmine_wiki_page(
                 action="get",
                 project_id=project_id,
-                wiki_page_title=wiki_title,
+                wiki_page_title=renamed_title,
             )
             assert "error" in verify_result
             assert "not found" in verify_result["error"].lower()
@@ -527,15 +700,17 @@ class TestRedmineIntegration:
         except Exception as e:
             pytest.fail(f"Integration test failed: {e}")
         finally:
-            # Clean up: attempt to delete the wiki page if it still exists
-            try:
-                await manage_redmine_wiki_page(
-                    action="delete",
-                    project_id=project_id,
-                    wiki_page_title=wiki_title,
-                )
-            except Exception:
-                pass  # Best effort cleanup
+            # Clean up: attempt to delete either title if it still exists
+            # (which of the two survives depends on where the test failed).
+            for title in (wiki_title, renamed_title):
+                try:
+                    await manage_redmine_wiki_page(
+                        action="delete",
+                        project_id=project_id,
+                        wiki_page_title=title,
+                    )
+                except Exception:
+                    pass  # Best effort cleanup
 
     @pytest.mark.skipif(not REDMINE_URL, reason="REDMINE_URL not configured")
     @pytest.mark.integration
@@ -2022,6 +2197,334 @@ class TestAgilePluginIntegration:
         assert (
             "error" not in result
         ), f"Combined story_points + notes update failed: {result}"
+
+
+_TAGS_SKIP = pytest.mark.skipif(
+    not REDMINE_URL
+    or os.getenv("REDMINE_TAGS_ENABLED", "false").strip().lower()
+    not in {"1", "true", "yes", "on"},
+    reason="REDMINE_URL not configured or REDMINE_TAGS_ENABLED not true",
+)
+
+
+class TestTagsPluginIntegration:
+    """Integration tests for AlphaNodes additional_tags plugin support.
+
+    Requires:
+    - REDMINE_URL configured
+    - REDMINE_TAGS_ENABLED=true
+    - additional_tags plugin installed with issue tagging enabled
+    - view_issue_tags permission for the API user
+    - REDMINE_TAGS_TEST_ISSUE_ID pointing at a tagged issue (optional; the
+      test asserts the key shape rather than specific tag names)
+    """
+
+    @_TAGS_SKIP
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_get_issue_includes_tags_array(self):
+        """get_redmine_issue returns a `tags` list when REDMINE_TAGS_ENABLED=true."""
+        redmine = _get_redmine_or_none()
+        if redmine is None:
+            pytest.skip("Redmine client not initialized")
+
+        issue_id_env = os.getenv("REDMINE_TAGS_TEST_ISSUE_ID")
+        if issue_id_env:
+            issue_id = int(issue_id_env)
+        else:
+            try:
+                issues = list(redmine.issue.filter(status_id="*", limit=1))
+            except Exception:
+                pytest.skip("Could not list issues")
+            if not issues:
+                pytest.skip("No issues available to probe")
+            issue_id = issues[0].id
+
+        from redmine_mcp_server.tools.issues import get_redmine_issue
+
+        result = await get_redmine_issue(issue_id)
+
+        assert "error" not in result, f"get_redmine_issue failed: {result}"
+        assert "tags" in result, "tags key missing from result"
+        assert isinstance(result["tags"], list)
+        for tag in result["tags"]:
+            assert "name" in tag
+            assert "id" in tag
+
+    @_TAGS_SKIP
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_tag_list_write_roundtrip(self):
+        """create/update accept tag_list and get_redmine_issue reads it back.
+
+        Destructive (creates + deletes an issue), so it only runs when
+        REDMINE_TAGS_TEST_PROJECT_ID names a sandbox project to write to.
+        The caller/API user must hold create_issue_tags on that project.
+        """
+        project_id = os.getenv("REDMINE_TAGS_TEST_PROJECT_ID")
+        if not project_id:
+            pytest.skip("REDMINE_TAGS_TEST_PROJECT_ID not set")
+
+        from redmine_mcp_server.tools.issues import (
+            create_redmine_issue,
+            update_redmine_issue,
+            get_redmine_issue,
+            delete_redmine_issue,
+        )
+
+        created = await create_redmine_issue(
+            project_id=int(project_id),
+            subject="[MCP TAG VERIFY] delete me",
+            description="additional_tags write round-trip",
+            fields={"tag_list": ["mcp-verify-tag"]},
+            extra_fields=_integration_test_custom_fields(),
+        )
+        assert "error" not in created, f"create failed: {created}"
+        issue_id = created["id"]
+        try:
+            after_create = await get_redmine_issue(issue_id, include_journals=False)
+            names = {t["name"] for t in after_create.get("tags", [])}
+            assert (
+                "mcp-verify-tag" in names
+            ), f"tag not applied on create: {after_create.get('tags')}"
+
+            upd = await update_redmine_issue(
+                issue_id, {"tag_list": ["mcp-verify-tag", "mcp-verify-two"]}
+            )
+            assert "error" not in upd, f"update failed: {upd}"
+            after_update = await get_redmine_issue(issue_id, include_journals=False)
+            names = {t["name"] for t in after_update.get("tags", [])}
+            assert {"mcp-verify-tag", "mcp-verify-two"} <= names
+        finally:
+            await delete_redmine_issue(issue_id, confirm_delete=True)
+
+
+@pytest.mark.skipif(not REDMINE_URL, reason="REDMINE_URL not configured")
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_wiki_upload_and_attachment_only_update():
+    """Attach on create, then attach again without resending the body."""
+    redmine = _get_redmine_or_none()
+    if redmine is None:
+        pytest.skip("Redmine client not initialized")
+
+    from redmine_mcp_server.tools.wiki import manage_redmine_wiki_page
+
+    title = "Integration_Upload_Probe"
+    project_id = os.getenv("REDMINE_TEST_PROJECT", "testing-project1")
+    payload = base64.b64encode(b"integration probe").decode("ascii")
+
+    # Best-effort cleanup of a page left behind by a previous crashed run.
+    # Wiki create is a PUT upsert: against an already-existing page it
+    # returns 204, which python-redmine surfaces as a ValidationError
+    # ("Resource already exists"). The result is ignored here, covering
+    # both the normal first run (page not found) and a stale leftover.
+    await manage_redmine_wiki_page(
+        action="delete", project_id=project_id, wiki_page_title=title
+    )
+
+    created = await manage_redmine_wiki_page(
+        action="create",
+        project_id=project_id,
+        wiki_page_title=title,
+        text="# Probe\n\nbody",
+        uploads=[{"filename": "probe_one.txt", "content_base64": payload}],
+    )
+    assert "error" not in created, created
+
+    try:
+        fetched = await manage_redmine_wiki_page(
+            action="get", project_id=project_id, wiki_page_title=title
+        )
+        names = {a["filename"] for a in fetched["attachments"]}
+        assert "probe_one.txt" in names
+
+        # Attachment-only: no text passed, body must survive untouched.
+        updated = await manage_redmine_wiki_page(
+            action="update",
+            project_id=project_id,
+            wiki_page_title=title,
+            uploads=[{"filename": "probe_two.txt", "content_base64": payload}],
+        )
+        assert "error" not in updated, updated
+        assert _unwrap_insecure_content(updated["text"]) == _unwrap_insecure_content(
+            created["text"]
+        )
+        names = {a["filename"] for a in updated["attachments"]}
+        assert {"probe_one.txt", "probe_two.txt"} <= names
+    finally:
+        await manage_redmine_wiki_page(
+            action="delete", project_id=project_id, wiki_page_title=title
+        )
+
+
+_DRAWIO_SKIP = pytest.mark.skipif(
+    not REDMINE_URL
+    or os.getenv("REDMINE_DRAWIO_ENABLED", "false").strip().lower()
+    not in {"1", "true", "yes", "on"},
+    reason="REDMINE_URL not configured or REDMINE_DRAWIO_ENABLED not true",
+)
+
+# A minimal drawio document. The label is what proves the plugin read the
+# bytes we uploaded: it can only reach the rendered page by way of the
+# attachment, so finding it rules out an empty diagram container.
+_DRAWIO_LABEL = "MCP Drawio Probe"
+_DRAWIO_XML = (
+    '<mxfile host="app.diagrams.net">'
+    '<diagram id="probe" name="Page-1">'
+    '<mxGraphModel dx="800" dy="600" grid="0" page="1"><root>'
+    '<mxCell id="0"/><mxCell id="1" parent="0"/>'
+    f'<mxCell id="2" value="{_DRAWIO_LABEL}" style="rounded=1" vertex="1" '
+    'parent="1"><mxGeometry x="80" y="80" width="160" height="60" '
+    'as="geometry"/></mxCell>'
+    "</root></mxGraphModel></diagram></mxfile>"
+)
+
+
+def _fetch_wiki_html(project_id, title):
+    """GET a wiki page as HTML, so macro expansion can be inspected.
+
+    The REST API hands back the raw wiki source, which says nothing about
+    whether a macro rendered. Redmine's WikiController declares
+    ``accept_api_auth`` on ``show``, so API-key and Basic credentials both
+    authenticate this request even though the response is HTML.
+    """
+    import requests
+
+    config = dict(_build_requests_config())
+    session = requests.Session()
+    session.trust_env = config.pop("trust_env", True)
+    for attr, value in config.items():
+        setattr(session, attr, value)
+
+    url = f"{REDMINE_URL}/projects/{project_id}/wiki/{quote(title)}"
+    kwargs = {}
+    if REDMINE_API_KEY:
+        kwargs["params"] = {"key": REDMINE_API_KEY}
+    else:
+        kwargs["auth"] = (REDMINE_USERNAME, REDMINE_PASSWORD)
+
+    try:
+        return session.get(url, allow_redirects=False, **kwargs)
+    finally:
+        session.close()
+
+
+@_DRAWIO_SKIP
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_drawio_macro_renders_uploaded_diagram():
+    """A .drawio upload plus the macro renders as a diagram, not macro text.
+
+    Requires the `redmine_drawio` plugin on the target server, hence the
+    REDMINE_DRAWIO_ENABLED gate (a test-only switch; unlike
+    REDMINE_AGILE_ENABLED / REDMINE_TAGS_ENABLED the server does not read
+    it). Uploading a diagram is byte-identical to any other binary upload
+    from the server's side, so the assertion that carries the weight is on
+    the rendered HTML: it is the only place the plugin's own behaviour shows.
+    """
+    redmine = _get_redmine_or_none()
+    if redmine is None:
+        pytest.skip("Redmine client not initialized")
+
+    from redmine_mcp_server.tools.wiki import manage_redmine_wiki_page
+
+    title = "Integration_Drawio_Probe"
+    project_id = os.getenv("REDMINE_TEST_PROJECT", "testing-project1")
+    filename = "mcp_probe.drawio"
+    payload = base64.b64encode(_DRAWIO_XML.encode("utf-8")).decode("ascii")
+
+    # Best-effort cleanup of a page left behind by a previous crashed run;
+    # see test_wiki_upload_and_attachment_only_update for why the result of
+    # this delete is ignored.
+    await manage_redmine_wiki_page(
+        action="delete", project_id=project_id, wiki_page_title=title
+    )
+
+    created = await manage_redmine_wiki_page(
+        action="create",
+        project_id=project_id,
+        wiki_page_title=title,
+        text=f"h1. Diagram probe\n\n{{{{drawio_attach({filename})}}}}\n",
+        uploads=[{"filename": filename, "content_base64": payload}],
+    )
+    assert "error" not in created, created
+
+    try:
+        assert filename in {a["filename"] for a in created["attachments"]}
+
+        response = _fetch_wiki_html(project_id, title)
+        assert response.status_code == 200, (
+            f"expected the rendered page, got HTTP {response.status_code} "
+            f"({response.headers.get('location', 'no redirect target')})"
+        )
+        html = response.text
+
+        # The macro either expands into a mxgraph container or is left in the
+        # page as literal text / a macro error, so both directions are checked.
+        assert 'class="mxgraph"' in html, "drawio macro did not render a diagram"
+        assert "drawio_attach" not in html, "macro text survived into the page"
+        assert "Error executing" not in html, "Redmine reported a macro error"
+        assert _DRAWIO_LABEL in html, "rendered diagram does not carry our XML"
+    finally:
+        await manage_redmine_wiki_page(
+            action="delete", project_id=project_id, wiki_page_title=title
+        )
+
+
+class TestUnmappedFieldsIntegration:
+    """Integration test for the `unmapped_fields` pass-through.
+
+    Any Redmine that runs a plugin adding a top-level issue key exercises
+    this. The AlphaNodes additional_tags plugin is the easiest one to get:
+    with `REDMINE_TAGS_ENABLED` off, its `tags` array has no serializer of
+    its own and so arrives under `unmapped_fields`. On a stock Redmine with
+    no such plugin the key is absent, which is the other half of the
+    contract, so both outcomes are asserted rather than skipped.
+    """
+
+    @pytest.mark.skipif(not REDMINE_URL, reason="REDMINE_URL not configured")
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_unmapped_fields_shape_on_a_live_issue(self):
+        redmine = _get_redmine_or_none()
+        if redmine is None:
+            pytest.skip("Redmine client not initialized")
+
+        try:
+            issues = list(redmine.issue.filter(status_id="*", limit=1))
+        except Exception as exc:
+            pytest.skip(f"Could not list issues: {exc}")
+        if not issues:
+            pytest.skip("No issues available to probe")
+
+        from redmine_mcp_server.tools.issues import (
+            _ISSUE_PAYLOAD_SKIP_KEYS,
+            _UNMAPPED_VALUE_MAX_CHARS,
+            get_redmine_issue,
+        )
+
+        result = await get_redmine_issue(issues[0].id)
+        assert "error" not in result, f"get_redmine_issue failed: {result}"
+
+        # Stock Redmine 3.x+ sends both, so they are mapped, not passed through.
+        assert "total_estimated_hours" in result
+        assert "total_spent_hours" in result
+
+        if "unmapped_fields" not in result:
+            # A Redmine with no plugin keys on the issue: the key must be
+            # omitted rather than emitted empty.
+            return
+
+        unmapped = result["unmapped_fields"]
+        assert isinstance(unmapped, dict) and unmapped, "empty key should be omitted"
+        assert not set(unmapped) & set(_ISSUE_PAYLOAD_SKIP_KEYS)
+        for key, value in unmapped.items():
+            assert value is not None, f"{key} is null and should have been dropped"
+            assert len(json.dumps(value, default=str)) <= _UNMAPPED_VALUE_MAX_CHARS
+        for value in unmapped.values():
+            if isinstance(value, str):
+                assert _INSECURE_CONTENT_PATTERN.match(value), "string not wrapped"
 
 
 if __name__ == "__main__":

@@ -12,6 +12,13 @@ from fastmcp import Client
 from redmine_mcp_server import server as _server  # noqa: F401  -- register tools
 from redmine_mcp_server import tools  # noqa: F401  -- triggers @mcp.tool
 
+
+@pytest.fixture(autouse=True)
+def _full_surface(all_plugin_tools_visible):
+    """Enumerating tests must see every plugin tool (see conftest)."""
+    yield
+
+
 # Source-of-truth for what each manage_X tool MUST expose. Adding a new
 # action requires updating both the tool spec AND this map so the
 # schema cannot silently drift back to a plain string.
@@ -42,6 +49,9 @@ EXPECTED_ACTIONS = {
         "rename",
     },
     "manage_document": {"list", "get", "create", "update"},
+    "manage_deal": {"list", "get", "create", "update", "delete"},
+    "manage_crm_note": {"get", "create", "update", "delete"},
+    "manage_deal_category": {"list", "create", "update", "delete"},
 }
 
 
@@ -52,7 +62,7 @@ async def test_manage_tool_action_is_json_schema_enum(tool_name, expected):
         listed = {t.name: t for t in await client.list_tools()}
     assert tool_name in listed, f"Tool {tool_name} not registered"
 
-    schema = listed[tool_name].inputSchema or {}
+    schema = listed[tool_name].input_schema or {}
     action_prop = schema.get("properties", {}).get("action", {})
 
     # Pydantic renders Literal["x", "y"] as `enum: [...]` but a

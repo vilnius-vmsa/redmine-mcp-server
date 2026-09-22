@@ -217,13 +217,13 @@ class TestSearchEntireRedmine:
 
         # Only valid types should be passed
         call_kwargs = mock_redmine.search.call_args[1]
-        assert set(call_kwargs.get("resources", [])) == {"issues", "wiki_pages"}
+        assert set(call_kwargs.get("resources", [])) == {"issues", "wiki_pages", "news"}
 
     @pytest.mark.asyncio
     @patch("redmine_mcp_server._client.redmine")
     @patch("redmine_mcp_server._cleanup._ensure_cleanup_started")
     async def test_search_default_resources(self, mock_cleanup, mock_redmine):
-        """Test that default search includes both issues and wiki_pages."""
+        """Test that default search includes issues, wiki_pages and news."""
         from redmine_mcp_server.tools.search import search_entire_redmine
 
         mock_redmine.search.return_value = {}
@@ -231,7 +231,7 @@ class TestSearchEntireRedmine:
         await search_entire_redmine(query="test")
 
         call_kwargs = mock_redmine.search.call_args[1]
-        assert set(call_kwargs.get("resources", [])) == {"issues", "wiki_pages"}
+        assert set(call_kwargs.get("resources", [])) == {"issues", "wiki_pages", "news"}
 
     @pytest.mark.asyncio
     @patch("redmine_mcp_server._client.redmine")
@@ -381,6 +381,75 @@ class TestManageRedmineWikiPageGet:
         assert result["author"]["name"] == "John Doe"
         assert result["project"]["id"] == 1
         assert result["project"]["name"] == "My Project"
+
+    @pytest.mark.asyncio
+    @patch("redmine_mcp_server._client.redmine")
+    @patch("redmine_mcp_server._cleanup._ensure_cleanup_started")
+    async def test_wiki_page_project_as_dict(
+        self, mock_cleanup, mock_redmine, mock_wiki_page
+    ):
+        """Redmine 7.0 returns project as a plain dict (Redmine #43569).
+
+        python-redmine leaves it unwrapped because WikiPage._resource_map
+        does not list it, so the serializer must read it as a dict.
+        """
+        from redmine_mcp_server.tools.wiki import manage_redmine_wiki_page
+
+        mock_wiki_page.project = {"id": 1, "name": "Platform Test"}
+        mock_redmine.wiki_page.get.return_value = mock_wiki_page
+
+        result = await manage_redmine_wiki_page(
+            action="get", project_id="platform-test", wiki_page_title="TestPage"
+        )
+
+        assert result["project"] == {"id": 1, "name": "Platform Test"}
+
+    @pytest.mark.asyncio
+    @patch("redmine_mcp_server._client.redmine")
+    @patch("redmine_mcp_server._cleanup._ensure_cleanup_started")
+    async def test_wiki_page_reports_parent_title(
+        self, mock_cleanup, mock_redmine, mock_wiki_page
+    ):
+        """A child page reports its parent so hierarchy survives a get.
+
+        python-redmine wraps the parent as a WikiPage resource carrying
+        only ``title``; its ``id`` answers 0 and its ``name`` answers
+        "", so _named_ref would mint a fabricated {"id": 0, "name": ""}
+        here instead of failing. Read the title directly. See #270.
+        """
+        from redmine_mcp_server.tools.wiki import manage_redmine_wiki_page
+
+        parent = Mock()
+        parent.title = "Handbook"
+        parent.id = 0
+        parent.name = ""
+        mock_wiki_page.parent = parent
+        mock_redmine.wiki_page.get.return_value = mock_wiki_page
+
+        result = await manage_redmine_wiki_page(
+            action="get", project_id="my-project", wiki_page_title="Installation Guide"
+        )
+
+        assert result["parent_title"] == "Handbook"
+        assert "parent" not in result
+
+    @pytest.mark.asyncio
+    @patch("redmine_mcp_server._client.redmine")
+    @patch("redmine_mcp_server._cleanup._ensure_cleanup_started")
+    async def test_wiki_page_omits_parent_title_at_root(
+        self, mock_cleanup, mock_redmine, mock_wiki_page
+    ):
+        """A top-level page carries no parent_title key at all."""
+        from redmine_mcp_server.tools.wiki import manage_redmine_wiki_page
+
+        mock_wiki_page.parent = None
+        mock_redmine.wiki_page.get.return_value = mock_wiki_page
+
+        result = await manage_redmine_wiki_page(
+            action="get", project_id="my-project", wiki_page_title="Installation Guide"
+        )
+
+        assert "parent_title" not in result
 
     @pytest.mark.asyncio
     @patch("redmine_mcp_server._client.redmine")
@@ -588,7 +657,12 @@ class TestGlobalSearchIntegration:
 
         # Get project identifier - search API doesn't provide it for wiki pages
         # so we get the first available project
-        projects = list(_get_redmine_client().project.all())
+        # Direct client use inside an async test, so it opts out of the
+        # event-loop guard (issue #216).
+        from redmine_mcp_server._client import allow_loop_thread
+
+        with allow_loop_thread():
+            projects = list(_get_redmine_client().project.all())
         if not projects:
             pytest.skip("No projects available")
         project_id = projects[0].identifier

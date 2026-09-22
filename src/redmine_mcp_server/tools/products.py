@@ -9,12 +9,14 @@ from .._client import _get_redmine_client
 from .._decorators import ActionMode, action_dispatch
 from .._env import _is_products_enabled
 from .._errors import _handle_redmine_error
+from .._offload import offloaded
 from .._serialization import (
     _REDMINE_API_PAGE_CAP,
     _safe_isoformat,
     wrap_insecure_content,
 )
 from .._validation import _is_positive_int, _is_valid_project_id
+from .._plugin_visibility import plugin_tag
 from ..server import mcp
 
 _PRODUCTS_DISABLED_ERROR = {
@@ -81,7 +83,8 @@ def _product_to_dict(product: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-async def _list_products_action(
+@offloaded
+def _list_products_action(
     project_id: Optional[Union[str, int]] = None,
     limit: int = 100,
     **_: Any,
@@ -117,7 +120,8 @@ async def _list_products_action(
         )
 
 
-async def _get_product_action(
+@offloaded
+def _get_product_action(
     product_id: Optional[int] = None,
     **_: Any,
 ) -> Dict[str, Any]:
@@ -141,7 +145,8 @@ async def _get_product_action(
         )
 
 
-async def _create_product_action(
+@offloaded
+def _create_product_action(
     project_id: Optional[Union[str, int]] = None,
     name: Optional[str] = None,
     status_id: int = 1,
@@ -198,7 +203,8 @@ async def _create_product_action(
         )
 
 
-async def _update_product_action(
+@offloaded
+def _update_product_action(
     product_id: Optional[int] = None,
     fields: Optional[Dict[str, Any]] = None,
     **_: Any,
@@ -256,7 +262,7 @@ async def _manage_product_dispatch(action: str, **kwargs: Any) -> Any:
     }
 
 
-@mcp.tool()
+@mcp.tool(tags={plugin_tag("products")})
 async def manage_product(
     action: Literal["list", "get", "create", "update"],
     project_id: Optional[Union[str, int]] = None,
@@ -275,9 +281,49 @@ async def manage_product(
 ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
     """RedmineUP Products plugin tool. Combined CRUD-by-action.
 
-    Actions: ``list``, ``get``, ``create``, ``update``.
-    Requires ``REDMINE_PRODUCTS_ENABLED=true`` and the RedmineUP Products
-    plugin.
+    Actions: ``list``, ``get``, ``create``, ``update``. The plugin exposes no
+    delete endpoint, so there is no ``delete`` action. Requires
+    ``REDMINE_PRODUCTS_ENABLED=true`` and the RedmineUP Products plugin.
+
+    One flat signature serves every action, so most parameters apply to some
+    actions and are ignored by the rest. The two write actions do not take
+    their payload the same way: ``create`` reads the flat parameters below,
+    while ``update`` reads ``fields`` and ignores every flat one.
+
+    Args:
+        action: Which operation to run.
+        project_id: On ``list``, restrict to products in this project; omit
+            for every product the caller can see. On ``create``, the project
+            to file the new product under (optional). Name or numeric id.
+        limit: ``list`` only. Products per call, capped at 100 by Redmine;
+            a larger value is clamped, not rejected.
+        product_id: The product to act on. Required by ``get`` and
+            ``update``, ignored by the rest.
+        name: ``create`` only -- the new product's name (required).
+        status_id: ``create`` only. ``1`` (Active, the default) or ``2``
+            (Inactive); any other value is rejected. To change the status of
+            an existing product, pass ``status_id`` inside ``fields`` on
+            ``update``.
+        description: ``create`` only. Free text.
+        price: ``create`` only. Unit price as a number, e.g. ``49.99``.
+        currency: ``create`` only. Currency code, e.g. ``"USD"``.
+        code: ``create`` only. The product's catalogue code / SKU.
+        category_id: ``create`` only. Product category, as a positive
+            integer id.
+        tag_list: ``create`` only. Comma-separated tag names.
+        custom_fields: ``create`` only. List of ``{"id": N, "value": ...}``
+            dicts.
+        fields: ``update`` only, and the only way to change a product, so it
+            is required there and must be non-empty. Allowed keys: ``name``,
+            ``description``, ``price``, ``currency``, ``status_id``,
+            ``code``, ``project_id``, ``category_id``, ``tag_list``,
+            ``custom_fields``. Any other key is dropped without an error, so
+            check ``updated_fields`` in the response for what was written.
+
+    Returns:
+        ``list`` a list of product dicts, ``get`` / ``create`` one product
+        dict, ``update`` ``{"success": true, "product_id", "updated_fields"}``,
+        and ``{"error": ...}`` on failure.
     """
     if not _is_products_enabled():
         return dict(_PRODUCTS_DISABLED_ERROR)

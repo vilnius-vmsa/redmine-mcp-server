@@ -20,6 +20,13 @@ from fastmcp import Client
 from redmine_mcp_server import server as _server  # noqa: F401
 from redmine_mcp_server import tools  # noqa: F401
 
+
+@pytest.fixture(autouse=True)
+def _full_surface(all_plugin_tools_visible):
+    """Enumerating tests must see every plugin tool (see conftest)."""
+    yield
+
+
 # (tool_name, param, expected_min, expected_max-or-None, default)
 EXPECTED_BOUNDS = [
     ("get_gantt_chart", "limit", 1, 500, 250),
@@ -31,12 +38,15 @@ EXPECTED_BOUNDS = [
     ("list_time_entries", "limit", 1, 100, 25),
     ("list_time_entries", "offset", 0, None, 0),
     ("manage_contact", "limit", 1, 100, 100),
+    ("manage_contact", "offset", 0, None, 0),
+    ("manage_deal", "limit", 1, 100, 100),
     ("manage_product", "limit", 1, 100, 100),
     ("search_entire_redmine", "limit", 1, 100, 100),
     ("search_entire_redmine", "offset", 0, None, 0),
     ("search_redmine_issues", "limit", 1, 1000, 25),
     ("search_redmine_issues", "offset", 0, None, 0),
     ("manage_document", "limit", 1, 100, 100),
+    ("list_redmine_projects", "offset", 0, None, 0),
 ]
 
 
@@ -59,7 +69,7 @@ async def test_limit_offset_carry_explicit_bounds(
         listed = {t.name: t for t in await client.list_tools()}
 
     assert tool_name in listed, f"Tool {tool_name} not registered"
-    schema = listed[tool_name].inputSchema or {}
+    schema = listed[tool_name].input_schema or {}
     prop = schema.get("properties", {}).get(param)
     assert prop is not None, (
         f"{tool_name}.{param} is missing from the input schema. "
@@ -83,6 +93,35 @@ async def test_limit_offset_carry_explicit_bounds(
 
 
 @pytest.mark.asyncio
+async def test_project_list_limit_is_bounded_optional_int():
+    """`list_redmine_projects.limit` is genuinely optional.
+
+    ``None`` means "every visible project", which is what the tool returned
+    before it took a limit at all, so the default cannot become a number
+    without truncating existing callers. The integer branch still has to carry
+    bounds: python-redmine pages a supplied limit in full rather than stopping
+    at ``total_count``, so an unbounded one turns into ``ceil(limit/100)``
+    sequential requests no matter how few projects exist.
+    """
+    async with Client(_server.mcp) as client:
+        listed = {t.name: t for t in await client.list_tools()}
+
+    schema = listed["list_redmine_projects"].input_schema
+    prop = schema["properties"]["limit"]
+
+    any_of = prop.get("anyOf")
+    assert any_of, f"limit must remain Optional (anyOf with null); got {prop}"
+    int_branch = next((b for b in any_of if b.get("type") == "integer"), None)
+    assert int_branch is not None
+    assert int_branch.get("minimum") == 1
+    assert int_branch.get("maximum") == 1000
+
+    null_branch = next((b for b in any_of if b.get("type") == "null"), None)
+    assert null_branch is not None
+    assert prop.get("default") is None
+
+
+@pytest.mark.asyncio
 async def test_journal_limit_is_bounded_optional_int():
     """journal_limit is genuinely optional: None means "no pagination,
     return all journals". Keep the Optional, but the integer branch
@@ -90,7 +129,7 @@ async def test_journal_limit_is_bounded_optional_int():
     async with Client(_server.mcp) as client:
         listed = {t.name: t for t in await client.list_tools()}
 
-    schema = listed["get_redmine_issue"].inputSchema
+    schema = listed["get_redmine_issue"].input_schema
     prop = schema["properties"]["journal_limit"]
 
     # Pydantic emits Optional[int] as anyOf with the int branch first.

@@ -1,11 +1,11 @@
 """Unit tests for scripts/release.py changelog parsing."""
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
-
 
 _RELEASE_PATH = Path(__file__).resolve().parent.parent / "scripts" / "release.py"
 _spec = importlib.util.spec_from_file_location("release_script", _RELEASE_PATH)
@@ -18,7 +18,8 @@ def _write_changelog(tmp_path: Path, version: str, body: str) -> Path:
     changelog = tmp_path / "CHANGELOG.md"
     changelog.write_text(
         f"# Changelog\n\n## [{version}] - 2026-05-16\n{body}\n\n"
-        f"## [0.0.1] - 2025-01-01\n### Added\n- seed\n"
+        f"## [0.0.1] - 2025-01-01\n### Added\n- seed\n",
+        encoding="utf-8",
     )
     return changelog
 
@@ -90,3 +91,336 @@ def test_no_contributors_section_returns_empty_ack(tmp_path):
 
     assert ack == ""
     assert "thing" in main_body
+
+
+CHANGELOG_WITH_CREDITS = """# Changelog
+
+## [Unreleased]
+### Contributors
+- @newest — reported a bug ([#99](https://example.com/99))
+
+## [1.1.0] - 2020-02-01
+### Fixed
+- Something. Thanks @not-a-credit for the idea.
+
+### Contributors
+- @second, sent a PR ([#2](https://example.com/2))
+- @first — diagnosed and fixed the failure ([#1](https://example.com/1))
+
+## [1.0.0] - 2020-01-01
+### Contributors
+- @first — reported it first ([#0](https://example.com/0))
+"""
+
+README_WITH_MARKERS = """# Project
+
+## Contributors
+
+Thanks:
+
+<!-- contributors:start -->
+[@stale](https://github.com/stale)
+<!-- contributors:end -->
+
+## License
+"""
+
+
+def _write_contributor_fixtures(tmp_path: Path) -> None:
+    (tmp_path / "CHANGELOG.md").write_text(CHANGELOG_WITH_CREDITS, encoding="utf-8")
+    (tmp_path / "README.md").write_text(README_WITH_MARKERS, encoding="utf-8")
+
+
+def test_readme_contributors_lists_every_changelog_credit(tmp_path):
+    """Every handle credited in a `### Contributors` block belongs in the
+    README list, whatever form the contribution took. Hand-maintaining it
+    drifted: the list shipped for months missing six credited people."""
+    _write_contributor_fixtures(tmp_path)
+
+    release_script.update_readme_contributors(tmp_path, dry_run=False)
+
+    readme = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert "[@first](https://github.com/first)" in readme
+    # Both credit punctuations in this changelog are recognised: "@x —" and "@x,".
+    assert "[@second](https://github.com/second)" in readme
+    assert "[@newest](https://github.com/newest)" in readme
+    assert "not-a-credit" not in readme
+    assert "@stale" not in readme
+    assert "## License" in readme
+
+
+def test_readme_contributors_are_oldest_first_and_deduped():
+    """@first is credited in two releases: listed once, at the position of the
+    earliest credit, so a new name never reshuffles the line."""
+    assert release_script.collect_changelog_contributors(CHANGELOG_WITH_CREDITS) == [
+        "first",
+        "second",
+        "newest",
+    ]
+
+
+def test_readme_contributors_keeps_hyphenated_handles_whole():
+    """@stevehollis-orderflow is a real credit here; a handle regex that stops
+    at the hyphen would link a non-existent account."""
+    changelog = "## [1.0.0]\n### Contributors\n- @a-b-c — did a thing\n"
+    assert release_script.collect_changelog_contributors(changelog) == ["a-b-c"]
+
+
+def test_readme_contributors_dry_run_writes_nothing(tmp_path):
+    _write_contributor_fixtures(tmp_path)
+
+    release_script.update_readme_contributors(tmp_path, dry_run=True)
+
+    assert (tmp_path / "README.md").read_text(encoding="utf-8") == README_WITH_MARKERS
+
+
+def test_readme_contributors_fails_loudly_when_markers_go_missing(tmp_path):
+    """If the section is reformatted away, the release must raise rather than
+    silently stop crediting people."""
+    (tmp_path / "CHANGELOG.md").write_text(CHANGELOG_WITH_CREDITS, encoding="utf-8")
+    (tmp_path / "README.md").write_text(
+        "# Project\n\n## Contributors\n", encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="contributors:start"):
+        release_script.update_readme_contributors(tmp_path, dry_run=False)
+
+
+def test_version_bump_stages_the_readme():
+    """README must be staged, or the regenerated line never reaches the
+    release commit."""
+    import inspect
+
+    source = inspect.getsource(release_script.commit_version_bump)
+    assert '"README.md"' in source
+
+
+def test_committed_readme_contributors_match_the_changelog():
+    """Guards the checked-in files: a credit added to the CHANGELOG without a
+    release cut would otherwise sit unlisted until the next bump."""
+    repo = Path(__file__).resolve().parent.parent
+    expected = release_script.render_contributors_line(
+        release_script.collect_changelog_contributors(
+            (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        )
+    )
+    assert expected in (repo / "README.md").read_text(encoding="utf-8"), (
+        "README Contributors list is stale. Run:\n"
+        "    python scripts/release.py --sync-contributors"
+    )
+
+
+def test_sync_contributors_flag_is_wired_up():
+    """The remedy the failure above points at has to actually work, and it
+    must not touch the tree when previewed."""
+    repo = Path(__file__).resolve().parent.parent
+    result = subprocess.run(
+        [sys.executable, "scripts/release.py", "--sync-contributors", "--dry-run"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "[DRY-RUN] Would sync README.md Contributors list" in result.stdout
+
+
+def test_sync_contributors_refuses_to_ride_along_with_a_release():
+    repo = Path(__file__).resolve().parent.parent
+    result = subprocess.run(
+        [sys.executable, "scripts/release.py", "patch", "--sync-contributors"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "cannot be combined with a release run" in result.stderr
+
+
+def test_no_separator_after_handle_is_credited(tmp_path):
+    """Regression: v2.14.0 shipped with no Contributors block at all because
+    the prose style writes the handle with no separator following it."""
+    body = (
+        "### Added\n- thing\n\n"
+        "### Contributors\n"
+        "- @andilem proposed and implemented the tool allow list ([#255](url))\n"
+    )
+    _write_changelog(tmp_path, "2.14.0", body)
+
+    _, ack = release_script.extract_changelog_section(tmp_path, "2.14.0")
+
+    assert "@andilem" in ack
+    assert "proposed and implemented the tool allow list" in ack
+
+
+def test_contributor_without_at_handle_is_credited(tmp_path):
+    """An organisation credited by name has no @handle; v2.13.0 dropped
+    RedmineUP for that reason."""
+    body = (
+        "### Added\n- thing\n\n"
+        "### Contributors\n"
+        "- RedmineUP, provided an evaluation copy of the CRM PRO plugin\n"
+    )
+    _write_changelog(tmp_path, "2.13.0", body)
+
+    _, ack = release_script.extract_changelog_section(tmp_path, "2.13.0")
+
+    assert "RedmineUP" in ack
+    assert "evaluation copy" in ack
+
+
+def test_wrapped_entry_keeps_its_continuation_lines(tmp_path):
+    """Every shipped release truncated entries at the first line, losing the
+    PR links the credit format requires."""
+    body = (
+        "### Added\n- thing\n\n"
+        "### Contributors\n"
+        "- @alice: requested MCP tool annotations so clients can distinguish\n"
+        "  read-only calls from writes\n"
+        "  ([#221](https://example.invalid/221))\n"
+    )
+    _write_changelog(tmp_path, "1.0.0", body)
+
+    _, ack = release_script.extract_changelog_section(tmp_path, "1.0.0")
+
+    assert "read-only calls from writes" in ack
+    assert "[#221](https://example.invalid/221)" in ack
+
+
+def test_unparsable_contributors_section_raises(tmp_path):
+    """Credits must never be dropped silently. If the section exists but no
+    entry parses, the release stops instead of publishing without credit."""
+    body = "### Added\n- thing\n\n### Contributors\nnot a list item at all\n"
+    _write_changelog(tmp_path, "1.0.0", body)
+
+    with pytest.raises(ValueError, match="Contributors"):
+        release_script.extract_changelog_section(tmp_path, "1.0.0")
+
+
+def test_release_run_syncs_the_readme_contributors():
+    """The bump path must regenerate the README line it stages. The call once
+    lived only in an unused helper, so releases committed a stale README and
+    CI failed on the first new credit until --sync-contributors was run."""
+    import inspect
+
+    assert "update_readme_contributors(" in inspect.getsource(release_script.main)
+
+
+def test_notes_generation_runs_with_an_empty_context():
+    import inspect
+
+    source = inspect.getsource(release_script.generate_release_notes)
+    assert "*NOTES_CONTEXT_FLAGS" in source
+    assert release_script.NOTES_CONTEXT_FLAGS == [
+        "--setting-sources",
+        "",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+    ]
+
+
+_ACK = "Thanks to **@alice** for contributing:\n- a fix\n\n" + (
+    "Thanks to **RedmineUP** for contributing:\n- a licence"
+)
+
+
+def _notes(tmp_path: Path, title: str, body: str) -> Path:
+    path = tmp_path / "notes.md"
+    release_script.write_notes_file(path, title, body)
+    return path
+
+
+def test_approved_notes_round_trip(tmp_path):
+    path = _notes(tmp_path, "v1.2.0: Big release", "## Highlights\n\n" + _ACK)
+
+    title, body = release_script.load_approved_notes(path, "1.2.0", _ACK)
+
+    assert title == "v1.2.0: Big release"
+    assert body.startswith("## Highlights")
+
+
+def test_approved_notes_bare_tag_title_is_accepted(tmp_path):
+    path = _notes(tmp_path, "v1.2.0", "body")
+
+    assert release_script.load_approved_notes(path, "1.2.0", "")[0] == "v1.2.0"
+
+
+@pytest.mark.parametrize("title", ["v1.2.1: Wrong bump", "v1.2.01", "Big release"])
+def test_approved_notes_for_another_version_are_refused(tmp_path, title):
+    path = _notes(tmp_path, title, "body")
+
+    with pytest.raises(release_script.NotesFileError, match="this release is v1.2.0"):
+        release_script.load_approved_notes(path, "1.2.0", "")
+
+
+def test_approved_notes_dropping_a_credit_are_refused(tmp_path):
+    path = _notes(tmp_path, "v1.2.0: x", "Thanks to **@alice** only")
+
+    with pytest.raises(release_script.NotesFileError, match="RedmineUP"):
+        release_script.load_approved_notes(path, "1.2.0", _ACK)
+
+
+def test_approved_notes_missing_or_empty_are_refused(tmp_path):
+    with pytest.raises(release_script.NotesFileError, match="not found"):
+        release_script.load_approved_notes(tmp_path / "nope.md", "1.2.0", "")
+
+    empty = tmp_path / "empty.md"
+    empty.write_text("<!-- title: v1.2.0 -->\n\n", encoding="utf-8")
+    with pytest.raises(release_script.NotesFileError, match="empty body"):
+        release_script.load_approved_notes(empty, "1.2.0", "")
+
+
+def _preview_root(tmp_path: Path) -> Path:
+    (tmp_path / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## [Unreleased]\n### Added\n- thing\n\n"
+        "### Contributors\n- @alice did it ([#1](url))\n\n"
+        "## [1.1.0] - 2026-01-01\n### Added\n- seed\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_dry_run_saves_a_draft_the_real_run_accepts(tmp_path, monkeypatch):
+    root = _preview_root(tmp_path)
+    monkeypatch.setattr(
+        release_script,
+        "generate_release_notes",
+        lambda version, body, steering=None: ("v1.2.0: Things", "## Highlights"),
+    )
+    config = release_script.ReleaseConfig("minor", True, root)
+    notes_path = release_script.notes_file_path(root, "1.2.0")
+
+    release_script.preview_release_notes(config, "1.2.0", notes_path)
+
+    _, ack = release_script.extract_unreleased_section(root)
+    title, body = release_script.load_approved_notes(notes_path, "1.2.0", ack)
+    assert title == "v1.2.0: Things"
+    assert "**@alice**" in body
+
+
+def test_dry_run_never_overwrites_an_edited_draft(tmp_path, monkeypatch):
+    root = _preview_root(tmp_path)
+    notes_path = release_script.notes_file_path(root, "1.2.0")
+    release_script.write_notes_file(notes_path, "v1.2.0: Mine", "hand edited")
+
+    def boom(*args, **kwargs):
+        raise AssertionError("must not regenerate over an existing draft")
+
+    monkeypatch.setattr(release_script, "generate_release_notes", boom)
+    config = release_script.ReleaseConfig("minor", True, root)
+
+    release_script.preview_release_notes(config, "1.2.0", notes_path)
+
+    assert release_script.read_notes_file(notes_path) == ("v1.2.0: Mine", "hand edited")
+
+
+def test_notes_drafts_are_gitignored():
+    """A dry-run draft left in the tree would fail the real run's
+    clean-tree preflight."""
+    repo = Path(__file__).resolve().parent.parent
+    result = subprocess.run(
+        ["git", "check-ignore", "-q", "release_notes_v9.9.9.md"], cwd=repo
+    )
+    assert result.returncode == 0

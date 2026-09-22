@@ -66,12 +66,14 @@ from .._client import _get_redmine_client
 from .._decorators import ActionMode, action_dispatch
 from .._env import _is_dmsf_enabled
 from .._errors import _handle_redmine_error
+from .._offload import offloaded
 from .._serialization import (
     _REDMINE_API_PAGE_CAP,
     _safe_isoformat,
     wrap_insecure_content,
 )
 from .._validation import _is_positive_int, _is_valid_project_id
+from .._plugin_visibility import plugin_tag
 from ..server import mcp
 
 _DMSF_DISABLED_ERROR = {
@@ -212,7 +214,8 @@ def _extract_dmsf_single_doc(payload: Any) -> Dict[str, Any]:
     return {}
 
 
-async def _list_documents_action(
+@offloaded
+def _list_documents_action(
     project_id: Optional[Union[str, int]] = None,
     folder_id: Optional[int] = None,
     limit: int = 100,
@@ -268,7 +271,8 @@ async def _list_documents_action(
         )
 
 
-async def _get_document_action(
+@offloaded
+def _get_document_action(
     document_id: Optional[int] = None,
     **_: Any,
 ) -> Dict[str, Any]:
@@ -336,7 +340,8 @@ def _split_dmsf_version(version: str) -> Union[Dict[str, str], Dict[str, str]]:
     }
 
 
-async def _create_document_action(
+@offloaded
+def _create_document_action(
     project_id: Optional[Union[str, int]] = None,
     filename: Optional[str] = None,
     content_base64: Optional[str] = None,
@@ -463,7 +468,8 @@ def _fetch_current_dmsf_doc(document_id: int) -> Dict[str, Any]:
     return _extract_dmsf_single_doc(payload)
 
 
-async def _update_document_action(
+@offloaded
+def _update_document_action(
     document_id: Optional[int] = None,
     fields: Optional[Dict[str, Any]] = None,
     **_: Any,
@@ -549,7 +555,7 @@ async def _manage_document_dispatch(action: str, **kwargs: Any) -> Any:
     }
 
 
-@mcp.tool()
+@mcp.tool(tags={plugin_tag("dmsf")})
 async def manage_document(
     action: Literal["list", "get", "create", "update"],
     project_id: Optional[Union[str, int]] = None,
