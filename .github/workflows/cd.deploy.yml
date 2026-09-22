@@ -108,16 +108,20 @@ jobs:
           # image reference so logs and recovery commands see this stack.
           echo "REDMINE_MCP_IMAGE=${image_ref}" >> "$GITHUB_ENV"
 
-      - name: Verify image provenance
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          command -v gh >/dev/null
-          gh attestation verify "oci://${IMAGE_REF}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/ci.build.yml"
+      # The CI build creates and publishes a Sigstore provenance attestation
+      # alongside this immutable image digest. Keep this disabled until the
+      # self-hosted `mcp` runner has GitHub CLI (`gh`) installed.
+      #
+      # - name: Verify image provenance
+      #   shell: bash
+      #   env:
+      #     GH_TOKEN: ${{ github.token }}
+      #   run: |
+      #     set -euo pipefail
+      #     command -v gh >/dev/null
+      #     gh attestation verify "oci://${IMAGE_REF}" \
+      #       --repo "$GITHUB_REPOSITORY" \
+      #       --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/ci.build.yml"
 
       - name: Write runtime configuration
         shell: bash
