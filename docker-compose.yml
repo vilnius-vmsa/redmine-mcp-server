@@ -2,6 +2,10 @@ version: '3.8'
 
 services:
   redmine-mcp-server:
+    labels:
+      vilnius.logging.enabled: "true"
+      vilnius.logging.app: redmine-mcp-server
+      vilnius.logging.component: mcp
     build:
       context: .
       dockerfile: Dockerfile
@@ -22,6 +26,11 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 networks:
   redmine-mcp-network:

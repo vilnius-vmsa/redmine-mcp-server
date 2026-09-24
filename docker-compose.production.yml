@@ -3,6 +3,10 @@ services:
     # CI supplies this as ghcr.io/vilnius-vmsa/redmine-mcp-server-production@sha256:... .
     # A digest, rather than a tag, makes the deployed artifact immutable.
     image: "${REDMINE_MCP_IMAGE:?Set REDMINE_MCP_IMAGE to an immutable image digest}"
+    labels:
+      vilnius.logging.enabled: "true"
+      vilnius.logging.app: redmine-mcp-server
+      vilnius.logging.component: mcp
     pull_policy: always
     container_name: redmine-mcp-server
     ports:
@@ -33,6 +37,11 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 networks:
   redmine-mcp-network:
