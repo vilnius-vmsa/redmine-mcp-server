@@ -19,7 +19,12 @@ COPY README.md ./
 
 # Install dependencies and the project in a virtual environment
 RUN uv venv /opt/venv && \
-    uv pip install . --python=/opt/venv/bin/python
+    uv pip install . --python=/opt/venv/bin/python && \
+    rm -rf \
+        /usr/local/lib/python3.13/site-packages/pip* \
+        /usr/local/lib/python3.13/site-packages/setuptools* \
+        /usr/local/lib/python3.13/ensurepip \
+        /usr/local/bin/pip*
 
 # Production stage
 FROM python:3.13-slim@sha256:8d9d0b8bcf6506481eae4907c18f5e3e7902e629f5f6d684f9e7c32e85e3ddf0 AS runtime
@@ -43,9 +48,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Install system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl && \
-    rm -rf /var/lib/apt/lists/*
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    rm -rf \
+        /usr/local/lib/python3.13/site-packages/pip* \
+        /usr/local/lib/python3.13/site-packages/setuptools* \
+        /usr/local/lib/python3.13/ensurepip \
+        /usr/local/bin/pip*
 
 # Create non-root user
 RUN groupadd --gid 1000 appuser && \
@@ -70,7 +79,7 @@ USER appuser
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://127.0.0.1:${SERVER_PORT:-8000}/health || exit 1
+    CMD ["python", "-c", "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.getenv(\"SERVER_PORT\", \"8000\")}/health', timeout=5)"]
 
 STOPSIGNAL SIGTERM
 
