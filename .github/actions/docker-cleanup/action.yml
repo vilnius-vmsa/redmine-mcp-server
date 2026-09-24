@@ -1,0 +1,49 @@
+name: "Docker Cleanup"
+description: "Prunes unused Docker images, networks, and build cache. Volumes are intentionally skipped."
+
+inputs:
+  keep_versions:
+    description: "Number of latest image versions to keep per repository"
+    required: false
+    default: "3"
+  image_age:
+    description: "Minimum age of unused build cache to prune"
+    required: false
+    default: "168h"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Cleanup unused Docker resources
+      shell: bash
+      run: |
+        echo "::notice::Volume pruning is intentionally skipped — prune volumes manually when needed: docker volume prune"
+        echo "Current volume disk usage:"
+        docker system df --format "table {{.Type}}\t{{.TotalCount}}\t{{.Size}}\t{{.Reclaimable}}" | grep -E "^(TYPE|Local)"
+        KEEP_VERSIONS="${{ inputs.keep_versions }}"
+        if ! [[ "$KEEP_VERSIONS" =~ ^[1-9][0-9]*$ ]]; then
+          echo "::error::keep_versions must be a positive integer >= 1, got: '$KEEP_VERSIONS'"
+          exit 1
+        fi
+
+        echo "Removing dangling (untagged) images..."
+        docker image prune -f
+
+        echo "Pruning old tagged images — keeping $KEEP_VERSIONS latest per repository..."
+        docker images --format '{{.Repository}}' | awk '$0 != "<none>"' | sort -u | while read -r repo; do
+          docker images "$repo" --format '{{.CreatedAt}}|{{.Repository}}:{{.Tag}}' \
+            | awk -F'|' '$2 !~ /^<none>:/' \
+            | sort -t'|' -rk1 \
+            | awk -F'|' '{print $NF}' \
+            | tail -n +$(( KEEP_VERSIONS + 1 )) | while read -r img; do
+            echo "  Removing: $img"
+            docker rmi "$img" 2>/dev/null || true
+          done
+        done
+
+        echo "Pruning unused Docker networks..."
+        docker network prune -f
+        echo "Pruning build cache..."
+        docker builder prune -af --filter "until=${{ inputs.image_age }}"
+        echo "Disk usage after cleanup:"
+        docker system df

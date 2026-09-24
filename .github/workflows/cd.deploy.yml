@@ -65,8 +65,16 @@ jobs:
           # The ancestry check below needs the complete main history, not the
           # default one-commit checkout.
           fetch-depth: 0
-          sparse-checkout: docker-compose.production.yml
+          sparse-checkout: |
+            .github/actions/check-disk-space
+            .github/actions/docker-cleanup
+            docker-compose.production.yml
           sparse-checkout-cone-mode: false
+
+      - name: Check available disk space
+        uses: ./.github/actions/check-disk-space
+        with:
+          required_gb: "5"
 
       - name: Require a main-branch source commit
         shell: bash
@@ -163,6 +171,10 @@ jobs:
       - name: Verify local health endpoint
         shell: bash
         run: docker compose -f docker-compose.production.yml exec -T redmine-mcp-server curl --fail --silent --show-error --max-time 15 http://127.0.0.1:8000/health >/dev/null
+
+      - name: Cleanup unused Docker resources
+        uses: ./.github/actions/docker-cleanup
+        continue-on-error: true
 
       - name: Show service logs on failure
         if: failure()

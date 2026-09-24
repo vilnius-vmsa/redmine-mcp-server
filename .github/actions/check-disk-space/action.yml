@@ -1,0 +1,24 @@
+name: "Check Available Disk Space"
+description: "Fails the job if available disk space is below the required threshold."
+
+inputs:
+  required_gb:
+    description: "Minimum required free disk space in GB"
+    required: false
+    default: "3"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Check available disk space
+      shell: bash
+      run: |
+        echo "📦 Disk usage before deploy:"
+        df -h /
+        AVAILABLE_KB=$(df / | awk 'NR==2 {print $4}')
+        REQUIRED_KB=$(( ${{ inputs.required_gb }} * 1024 * 1024 ))
+        if [ "$AVAILABLE_KB" -lt "$REQUIRED_KB" ]; then
+          echo "❌ Not enough disk space. Available: $(( AVAILABLE_KB / 1024 / 1024 ))GB, Required: ${{ inputs.required_gb }}GB"
+          exit 1
+        fi
+        echo "✅ Sufficient disk space: $(( AVAILABLE_KB / 1024 / 1024 ))GB available"
