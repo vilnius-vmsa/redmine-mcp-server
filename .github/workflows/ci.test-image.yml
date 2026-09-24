@@ -53,6 +53,15 @@ jobs:
           docker run --detach --rm \
             --name "$CONTAINER_NAME" \
             --publish 127.0.0.1:8000:8000 \
+            --read-only \
+            --tmpfs /tmp:size=64m,mode=1777 \
+            --tmpfs /app/data:size=64m,mode=0750,uid=1000,gid=1000 \
+            --tmpfs /app/logs:size=64m,mode=0750,uid=1000,gid=1000 \
+            --tmpfs /app/attachments:size=64m,mode=0750,uid=1000,gid=1000 \
+            --security-opt no-new-privileges:true \
+            --cap-drop ALL \
+            --pids-limit 256 \
+            --memory 512m \
             --env REDMINE_URL= \
             "$IMAGE_REF"
 

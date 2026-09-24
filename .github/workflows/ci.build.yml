@@ -79,6 +79,8 @@ jobs:
           context: .
           push: true
           tags: ${{ env.IMAGE_NAME }}:sha-${{ env.BUILD_SHA }}
+          build-args: |
+            VCS_REF=${{ env.BUILD_SHA }}
           labels: |
             org.opencontainers.image.revision=${{ env.BUILD_SHA }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -87,13 +89,13 @@ jobs:
           cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
 
-      - name: Scan published image for critical vulnerabilities
+      - name: Scan published image for critical and high vulnerabilities
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE_NAME }}:sha-${{ env.BUILD_SHA }}
           format: table
           ignore-unfixed: true
-          severity: CRITICAL
+          severity: CRITICAL,HIGH
           exit-code: "1"
 
       - name: Record immutable image reference

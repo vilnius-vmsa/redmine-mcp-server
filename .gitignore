@@ -43,5 +43,8 @@ logs/
 # Local build/preview artifacts (demo page screenshots, etc.)
 .preview/
 
+# Private local hardening notes (never committed)
+.hardening/
+
 # Release-notes drafts (scripts/release.py --dry-run)
 release_notes_v*.md
