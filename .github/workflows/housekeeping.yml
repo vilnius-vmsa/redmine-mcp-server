@@ -1,0 +1,21 @@
+name: Housekeeping
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Retention in days'
+        required: false
+        default: '30'
+        type: string
+
+permissions:
+  actions: write
+
+jobs:
+  call-shared:
+    uses: vilnius-vmsa/shared-workflows/.github/workflows/housekeeping.yml@b6d15d76a2d26f0fd0ab6d91d94e9d4da84ba640
+    with:
+      days: ${{ inputs.days }}
