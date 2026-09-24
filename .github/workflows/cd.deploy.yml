@@ -170,7 +170,7 @@ jobs:
 
       - name: Verify local health endpoint
         shell: bash
-        run: docker compose -f docker-compose.production.yml exec -T redmine-mcp-server curl --fail --silent --show-error --max-time 15 http://127.0.0.1:8000/health >/dev/null
+        run: docker compose -f docker-compose.production.yml exec -T redmine-mcp-server python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=15)"
 
       - name: Cleanup unused Docker resources
         uses: ./.github/actions/docker-cleanup
