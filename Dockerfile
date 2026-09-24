@@ -1,5 +1,5 @@
 # Multi-stage Docker build for the Redmine MCP Server
-FROM python:3.13-slim AS builder
+FROM python:3.13-slim@sha256:8d9d0b8bcf6506481eae4907c18f5e3e7902e629f5f6d684f9e7c32e85e3ddf0 AS builder
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -22,7 +22,10 @@ RUN uv venv /opt/venv && \
     uv pip install . --python=/opt/venv/bin/python
 
 # Production stage
-FROM python:3.13-slim AS runtime
+FROM python:3.13-slim@sha256:8d9d0b8bcf6506481eae4907c18f5e3e7902e629f5f6d684f9e7c32e85e3ddf0 AS runtime
+
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.revision="$VCS_REF"
 
 # Set environment variables
 # SERVER_HOST/SERVER_PORT default to a reachable binding so ad-hoc
@@ -67,7 +70,9 @@ USER appuser
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:${SERVER_PORT:-8000}/health || exit 1
+    CMD curl -f http://127.0.0.1:${SERVER_PORT:-8000}/health || exit 1
+
+STOPSIGNAL SIGTERM
 
 # Expose default port (informational only; override with SERVER_PORT env var)
 EXPOSE 8000
