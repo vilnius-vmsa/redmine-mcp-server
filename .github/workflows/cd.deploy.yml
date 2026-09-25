@@ -141,7 +141,7 @@ jobs:
           umask 077
           printf '%s\n' "$ENV_FILE" > .env
 
-      - name: Write runtime introspection secret file
+      - name: Write persistent runtime introspection secret
         shell: bash
         env:
           INTROSPECT_CLIENT_SECRET: ${{ secrets.REDMINE_INTROSPECT_CLIENT_SECRET }}
@@ -149,15 +149,15 @@ jobs:
           set -euo pipefail
           test -n "$INTROSPECT_CLIENT_SECRET"
 
-          # This directory is unique to this deployment and is removed after
-          # the diagnostics step. Docker Compose copies each file into the
-          # container as a read-only /run/secrets/<name> mount.
-          secret_dir="$RUNNER_TEMP/redmine-mcp-server-secrets-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          secret_dir=/home/ubuntu/secrets/redmine-mcp-server
           install -d -m 0700 "$secret_dir"
           umask 077
-          printf '%s' "$INTROSPECT_CLIENT_SECRET" > "$secret_dir/redmine_introspect_client_secret"
+          secret_tmp="$secret_dir/.redmine_introspect_client_secret.tmp.$$"
+          trap 'rm -f "$secret_tmp"' EXIT
+          printf '%s' "$INTROSPECT_CLIENT_SECRET" > "$secret_tmp"
+          chmod 0444 "$secret_tmp"
+          mv -f "$secret_tmp" "$secret_dir/redmine_introspect_client_secret"
           echo "REDMINE_INTROSPECT_SECRET_PATH=$secret_dir/redmine_introspect_client_secret" >> "$GITHUB_ENV"
-          echo "RUNTIME_SECRETS_DIR=$secret_dir" >> "$GITHUB_ENV"
 
       - name: Pull and deploy verified image
         shell: bash
@@ -182,23 +182,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -z "${REDMINE_INTROSPECT_SECRET_PATH:-}" ]]; then
-            echo "Skipping Compose logs: runtime introspection secret file was not created."
+            echo "Skipping Compose logs: runtime introspection secret path was not configured."
             exit 0
           fi
           docker compose -f docker-compose.production.yml logs --no-color --tail=200
-
-      - name: Remove runtime secret files
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -z "${RUNTIME_SECRETS_DIR:-}" ]]; then
-            exit 0
-          fi
-          expected_prefix="$RUNNER_TEMP/redmine-mcp-server-secrets-"
-          if [[ "$RUNTIME_SECRETS_DIR" != "$expected_prefix"* ]]; then
-            echo "Refusing to remove an unexpected secrets directory." >&2
-            exit 1
-          fi
-          rm -f "$RUNTIME_SECRETS_DIR/redmine_introspect_client_secret"
-          rmdir "$RUNTIME_SECRETS_DIR" 2>/dev/null || true

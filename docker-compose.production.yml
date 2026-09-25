@@ -60,4 +60,4 @@ volumes:
 
 secrets:
   redmine_introspect_client_secret:
-    file: "${REDMINE_INTROSPECT_SECRET_PATH:?Set REDMINE_INTROSPECT_SECRET_PATH to the runtime secret file}"
+    file: "${REDMINE_INTROSPECT_SECRET_PATH:-/home/ubuntu/secrets/redmine-mcp-server/redmine_introspect_client_secret}"
