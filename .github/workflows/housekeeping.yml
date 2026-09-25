@@ -16,6 +16,6 @@ permissions:
 
 jobs:
   call-shared:
-    uses: vilnius-vmsa/shared-workflows/.github/workflows/housekeeping.yml@b6d15d76a2d26f0fd0ab6d91d94e9d4da84ba640
+    uses: vilnius-vmsa/shared-workflows/.github/workflows/housekeeping.yml@main
     with:
       days: ${{ inputs.days }}
