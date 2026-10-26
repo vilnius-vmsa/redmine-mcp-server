@@ -13,10 +13,8 @@ resolution-markers = [
 
 [manifest]
 constraints = [
-    { name = "certifi", specifier = ">=2026.10.19" },
     { name = "click", specifier = ">=8.3.3" },
     { name = "mcp", specifier = ">=2.2.0" },
-    { name = "opentelemetry-api", specifier = ">=1.45.1" },
 ]
 
 [[package]]
@@ -1541,10 +1539,12 @@ name = "redmine-mcp-server"
 version = "2.19.0"
 source = { editable = "." }
 dependencies = [
+    { name = "certifi" },
     { name = "cryptography" },
     { name = "fastmcp" },
     { name = "httpx" },
     { name = "joserfc" },
+    { name = "opentelemetry-api" },
     { name = "pyjwt", extra = ["crypto"] },
     { name = "python-dotenv" },
     { name = "python-multipart" },
@@ -1577,6 +1577,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "black", marker = "extra == 'dev'", specifier = ">=23.0.0,<27" },
+    { name = "certifi", specifier = ">=2026.10.19" },
     { name = "cryptography", specifier = ">=48.0.1,<51" },
     { name = "fastmcp", specifier = ">=4.1.2,<5" },
     { name = "flake8", marker = "extra == 'dev'", specifier = ">=6.0.0,<8" },
@@ -1584,6 +1585,7 @@ requires-dist = [
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.28.1,<1" },
     { name = "httpx", marker = "extra == 'test'", specifier = ">=0.28.1,<1" },
     { name = "joserfc", specifier = ">=1.6.7,<2" },
+    { name = "opentelemetry-api", specifier = ">=1.45.1" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.0.0,<5" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.15.0,<3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0,<10" },
