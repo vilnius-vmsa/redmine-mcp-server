@@ -27,7 +27,8 @@ Exclusions:
       (``AGILE_READ_SCOPES``, ``TAGS_READ_SCOPES``,
       ``TAGS_WRITE_SCOPES``, ``CRM_READ_SCOPES``, ``CRM_WRITE_SCOPES``,
       ``DEALS_READ_SCOPES``, ``DEALS_WRITE_SCOPES``,
-      ``CRM_NOTES_WRITE_SCOPES``)
+      ``CRM_NOTES_WRITE_SCOPES``, ``CRM_NOTES_EDIT_SCOPES``,
+      ``ORDERS_READ_SCOPES``)
       and are advertised only when that feature's env flag is set.
 """
 
@@ -36,9 +37,12 @@ from typing import Dict, Optional, Union
 
 from ._env import (
     _is_agile_enabled,
+    _crm_note_edit_scopes_enabled,
     _is_crm_enabled,
     _is_deals_enabled,
+    _is_helpdesk_enabled,
     _is_helpdesk_tickets_enabled,
+    _is_orders_enabled,
     _is_read_only_mode,
     _is_tags_enabled,
 )
@@ -78,6 +82,7 @@ WRITE_SCOPES: list[str] = [
     "delete_issue_watchers",  # manage_issue_watcher(action=remove)
     "add_issue_notes",  # update_redmine_issue notes-only carve-out
     "edit_issue_notes",  # manage_issue_note(action=edit)
+    "edit_own_issue_notes",  # manage_issue_note(action=edit), own notes only
     "set_notes_private",  # manage_issue_note(action=set_private)
     "log_time",  # manage_time_entry(action=create), import_time_entries
     "edit_time_entries",  # manage_time_entry(action=update)
@@ -219,6 +224,23 @@ DEALS_WRITE_SCOPES: list[str] = [
     "manage_deals",  # manage_deal_category(action=create|update|delete)
 ]
 
+# RedmineUP Products *order* permissions, advertised only under
+# REDMINE_ORDERS_ENABLED (see ``_env._is_orders_enabled`` for why orders do
+# not ride the products flag). manage_order is read-only, so there is no
+# write list.
+#
+# OrdersController authorizes #show against view_orders. #index skips
+# ``authorize`` but runs ``find_optional_project``, whose ``authorize_global``
+# checks view_orders_list against the token. The rows then come from
+# ``Order.visible`` (``Project.allowed_to_condition(user, :view_orders)``),
+# which reads the user's roles and not the token, so a token needs only
+# view_orders_list to list while the user's role still needs view_orders to
+# see any row.
+ORDERS_READ_SCOPES: list[str] = [
+    "view_orders",  # manage_order(action=get)
+    "view_orders_list",  # manage_order(action=list)
+]
+
 # RedmineUP CRM note permissions, advertised when contacts or deals are
 # enabled and the server is not read-only. Reads reuse view_contacts /
 # view_deals. notes#create has no authorize filter in the plugin, so
@@ -230,12 +252,31 @@ CRM_NOTES_WRITE_SCOPES: list[str] = [
     "delete_own_notes",  # same, for the note's author
 ]
 
+# RedmineUP CRM note *edit* permissions, advertised only when
+# REDMINE_CRM_NOTE_EDIT_SCOPES is set on top of a CRM flag, and the server is
+# not read-only (#450). CRM PRO 4.5.1 checks them for notes#update instead of
+# delete_notes. Earlier versions do not define them, and an unknown scope in
+# the advertised list fails consent with invalid_scope for every scope, so
+# they cannot ride CRM_NOTES_WRITE_SCOPES.
+CRM_NOTES_EDIT_SCOPES: list[str] = [
+    "edit_notes",  # manage_crm_note(action=update) on CRM 4.5.1+
+    "edit_own_notes",  # same, for the note's author
+]
+
+# RedmineUP Helpdesk reply permission, advertised when
+# REDMINE_HELPDESK_ENABLED is set and the server is not read-only (#431).
+# Helpdesk 4.5 denies helpdesk#email_note without send_response, and a token
+# only holds the permissions it was granted, whatever the caller's role says.
+HELPDESK_WRITE_SCOPES: list[str] = [
+    "send_response",  # send_helpdesk_email_reply
+]
+
 # RedmineUP Helpdesk ticket permissions, advertised only when
 # REDMINE_HELPDESK_TICKETS_ENABLED is set (#378). The flag is separate from
-# REDMINE_HELPDESK_ENABLED so that upgrading a deployment that only uses
-# send_helpdesk_email_reply advertises nothing new: a Redmine OAuth
-# application that does not grant an advertised scope fails consent with
-# invalid_scope for the whole list.
+# REDMINE_HELPDESK_ENABLED so that a deployment that only uses
+# send_helpdesk_email_reply does not need these: a Redmine OAuth application
+# that does not grant an advertised scope fails consent with invalid_scope
+# for the whole list.
 #
 # HelpdeskTicketsController runs ``before_action :authorize`` on show and
 # update, and the plugin maps helpdesk_tickets#show to view_helpdesk_tickets
@@ -246,12 +287,12 @@ CRM_NOTES_WRITE_SCOPES: list[str] = [
 # above). advertised_scopes() deduplicates against the CRM lists.
 HELPDESK_TICKETS_READ_SCOPES: list[str] = [
     "view_helpdesk_tickets",  # manage_helpdesk_ticket(action=get|set_contact)
-    "view_contacts",  # manage_helpdesk_ticket(action=set_contact) lookup
+    "view_contacts",  # manage_helpdesk_ticket(action=set_contact|create) lookup
     "view_private_contacts",  # same lookup, private contacts
 ]
 
 HELPDESK_TICKETS_WRITE_SCOPES: list[str] = [
-    "edit_helpdesk_tickets",  # manage_helpdesk_ticket(action=set_contact)
+    "edit_helpdesk_tickets",  # manage_helpdesk_ticket(action=set_contact|create)
 ]
 
 
@@ -275,9 +316,18 @@ def advertised_scopes() -> list[str]:
     :data:`DEALS_WRITE_SCOPES` follow the same shape under a flag of their
     own, ``REDMINE_DEALS_ENABLED`` (per :func:`_is_deals_enabled`), because
     the CRM plugin's Light edition does not define the deal permissions at
-    all. :data:`HELPDESK_TICKETS_READ_SCOPES` and
-    :data:`HELPDESK_TICKETS_WRITE_SCOPES` follow the same shape under
-    ``REDMINE_HELPDESK_TICKETS_ENABLED``. Extensions registered through
+    all. :data:`CRM_NOTES_WRITE_SCOPES` are appended when either CRM flag is
+    on unless the server is read-only, and :data:`CRM_NOTES_EDIT_SCOPES` on
+    top of them only under ``REDMINE_CRM_NOTE_EDIT_SCOPES`` (per
+    :func:`_crm_note_edit_scopes_enabled`), because CRM versions before PRO
+    4.5.1 do not define the edit permissions. :data:`HELPDESK_WRITE_SCOPES`
+    are appended under ``REDMINE_HELPDESK_ENABLED`` unless the server is
+    read-only, and
+    :data:`HELPDESK_TICKETS_READ_SCOPES` and
+    :data:`HELPDESK_TICKETS_WRITE_SCOPES` follow the deals shape under
+    ``REDMINE_HELPDESK_TICKETS_ENABLED``. :data:`ORDERS_READ_SCOPES` are
+    appended under ``REDMINE_ORDERS_ENABLED`` in both modes; ``manage_order``
+    has no write action, so there is no write list. Extensions registered through
     :mod:`.extensions` append their own lists last, under the same
     enabled/read-only rule, which is where a
     permission an in-house plugin declares for itself enters the list.
@@ -304,10 +354,16 @@ def advertised_scopes() -> list[str]:
             scopes += list(DEALS_WRITE_SCOPES)
     if (_is_crm_enabled() or _is_deals_enabled()) and not _is_read_only_mode():
         scopes += list(CRM_NOTES_WRITE_SCOPES)
+        if _crm_note_edit_scopes_enabled():
+            scopes += list(CRM_NOTES_EDIT_SCOPES)
+    if _is_helpdesk_enabled() and not _is_read_only_mode():
+        scopes += list(HELPDESK_WRITE_SCOPES)
     if _is_helpdesk_tickets_enabled():
         scopes += list(HELPDESK_TICKETS_READ_SCOPES)
         if not _is_read_only_mode():
             scopes += list(HELPDESK_TICKETS_WRITE_SCOPES)
+    if _is_orders_enabled():
+        scopes += list(ORDERS_READ_SCOPES)
 
     # Registered extensions come last, in registration order, so a stock
     # deployment -- where there are none -- gets exactly the list above.
@@ -527,16 +583,21 @@ TOOL_SCOPES: Dict[str, ToolScopeEntry] = {
     "create_checklist_item": frozenset({"edit_issues"}),
     "update_checklist_item": frozenset({"edit_issues"}),
     # --- helpdesk (RedmineUP plugin; the reply is recorded as an issue
-    # journal, so gate on add_issue_notes. The plugin's endpoint checks no
-    # permission of its own (#301), so this scope is the only one in play;
-    # a status_id change is left to Redmine) ---
+    # journal, so gate on add_issue_notes. Helpdesk 4.5 also checks
+    # send_response; that is advertised but not required here, because older
+    # versions check no permission of their own (#301) and requiring it would
+    # hide the tool from a token that can still send. A status_id change is
+    # left to Redmine) ---
     "send_helpdesk_email_reply": frozenset({"add_issue_notes"}),
     # Helpdesk tickets (#378). Both actions read /issues/:id first (the
     # plugin's own lookup skips issue visibility), then helpdesk_tickets#show,
     # which only view_helpdesk_tickets grants; set_contact adds the contact
     # lookup and helpdesk_tickets#update. The scopes are advertised under the
     # same flag that makes the tool visible, so requiring them cannot hide it
-    # on a deployment that never advertises them.
+    # on a deployment that never advertises them. create reads the project
+    # and the contact, then calls helpdesk_tickets#create, which the plugin
+    # gates on edit_helpdesk_tickets alone; add_issues is required here as
+    # well because the call creates an issue.
     "manage_helpdesk_ticket": {
         "get": frozenset({"view_issues", "view_helpdesk_tickets"}),
         "set_contact": frozenset(
@@ -547,6 +608,7 @@ TOOL_SCOPES: Dict[str, ToolScopeEntry] = {
                 "view_contacts",
             }
         ),
+        "create": frozenset({"add_issues", "view_contacts", "edit_helpdesk_tickets"}),
     },
     # --- products / CRM (RedmineUP plugins; Redmine enforces its own
     # plugin permissions, so these stay unrequired here. CRM scopes ARE
@@ -564,6 +626,16 @@ TOOL_SCOPES: Dict[str, ToolScopeEntry] = {
     "add_deal_product": frozenset(),
     "manage_crm_note": frozenset(),
     "list_crm_queries": frozenset(),
+    # Products plugin orders. Unlike the CRM tools above, manage_order does
+    # require its scopes: they are advertised only under REDMINE_ORDERS_ENABLED,
+    # the same flag that lists the tool, so requiring them cannot hide it on a
+    # deployment that never advertises them (the manage_helpdesk_ticket
+    # precedent). Each action needs the one scope its controller action
+    # checks against the token; see ORDERS_READ_SCOPES.
+    "manage_order": {
+        "list": frozenset({"view_orders_list"}),
+        "get": frozenset({"view_orders"}),
+    },
     # --- MCP Apps (read-only issue queries) ---
     "show_triage_board": frozenset({"view_issues"}),
     "get_triage_board_data": frozenset({"view_issues"}),
@@ -621,17 +693,51 @@ def _is_notes_only_update(arguments: Optional[dict]) -> bool:
     return set(fields) <= _NOTES_ONLY_FIELDS
 
 
+# manage_issue_note edit carve-out (#460): Redmine's Journal#editable_by?
+# allows edit_issue_notes, or edit_own_issue_notes when the note belongs to
+# the user. A token with only edit_own_issue_notes must pass, and Redmine
+# checks if the note belongs to the user.
+_OWN_NOTE_EDIT_SCOPES = frozenset({"edit_own_issue_notes"})
+
+
+def _is_note_edit(tool_name: str, arguments: Optional[dict]) -> bool:
+    return (
+        tool_name == "manage_issue_note" and (arguments or {}).get("action") == "edit"
+    )
+
+
 def required_scopes_for_call(
-    tool_name: str, entry: ToolScopeEntry, arguments: Optional[dict]
+    tool_name: str,
+    entry: ToolScopeEntry,
+    arguments: Optional[dict],
+    token_scopes: Optional[set] = None,
 ) -> Optional[frozenset]:
-    """Scope requirement for one call: per-tool carve-outs, then the map."""
+    """Scope requirement for one call: per-tool carve-outs, then the map.
+
+    ``token_scopes`` selects between alternative requirements. A note edit
+    requires ``edit_own_issue_notes`` instead of ``edit_issue_notes`` when
+    the token holds only the former.
+    """
     if tool_name == "update_redmine_issue" and _is_notes_only_update(arguments):
         return _NOTES_ONLY_SCOPES
-    return scopes_for_action(entry, arguments)
+    required = scopes_for_action(entry, arguments)
+    if (
+        required is not None
+        and token_scopes is not None
+        and _is_note_edit(tool_name, arguments)
+        and not required <= token_scopes
+        and _OWN_NOTE_EDIT_SCOPES <= token_scopes
+    ):
+        return _OWN_NOTE_EDIT_SCOPES
+    return required
 
 
 def tool_visible_for(tool_name: str, entry: ToolScopeEntry, token_scopes: set) -> bool:
     """Visibility for tools/list, including per-tool carve-outs."""
     if tool_name == "update_redmine_issue":
         return tool_visible(entry, token_scopes) or (_NOTES_ONLY_SCOPES <= token_scopes)
+    if tool_name == "manage_issue_note":
+        return tool_visible(entry, token_scopes) or (
+            _OWN_NOTE_EDIT_SCOPES <= token_scopes
+        )
     return tool_visible(entry, token_scopes)

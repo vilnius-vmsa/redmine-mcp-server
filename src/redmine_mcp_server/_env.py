@@ -35,6 +35,21 @@ def _is_products_enabled() -> bool:
     return _is_true_env("REDMINE_PRODUCTS_ENABLED", "false")
 
 
+def _is_orders_enabled() -> bool:
+    """Check if RedmineUP Products *orders* support is enabled.
+
+    Separate from :func:`_is_products_enabled` even though orders ship inside
+    the same plugin, because the plugin declares them as a project module of
+    their own (``project_module :orders``, beside ``:products``) with their
+    own permissions, so a deployment may enable one without the other. The
+    flag also advertises the order OAuth scopes, and a Redmine OAuth
+    application that does not grant an advertised scope fails consent for the
+    whole list, so turning on orders has to be an opt-in of its own rather
+    than a change under the products flag.
+    """
+    return _is_true_env("REDMINE_ORDERS_ENABLED", "false")
+
+
 def _is_crm_enabled() -> bool:
     """Check if RedmineUP CRM (Contacts) plugin support is enabled."""
     return _is_true_env("REDMINE_CRM_ENABLED", "false")
@@ -55,6 +70,21 @@ def _is_deals_enabled() -> bool:
     regress a working Light deployment on upgrade.
     """
     return _is_true_env("REDMINE_DEALS_ENABLED", "false")
+
+
+def _crm_note_edit_scopes_enabled() -> bool:
+    """Check if the CRM note *edit* permissions should be advertised (#450).
+
+    CRM PRO 4.5.1 checks ``edit_notes`` (or ``edit_own_notes`` for the
+    author) when a note is edited, so an OAuth token needs them for
+    ``manage_crm_note(action="update")``. Earlier CRM versions do not define
+    either permission, and Redmine fails OAuth consent with ``invalid_scope``
+    for the whole list if one requested scope is unknown, so advertising them
+    unconditionally would break OAuth on every older CRM install. The REST
+    API does not expose plugin versions, so this is an opt-in flag rather
+    than a runtime check. It has no effect unless a CRM flag is on.
+    """
+    return _is_true_env("REDMINE_CRM_NOTE_EDIT_SCOPES", "false")
 
 
 def _crm_edition() -> str:
@@ -79,6 +109,26 @@ def _crm_edition() -> str:
     if value not in {"light", "pro"}:
         raise RuntimeError(
             f"REDMINE_CRM_EDITION must be 'light' or 'pro', got '{value}'."
+        )
+    return value
+
+
+TEXT_FORMATTING_VALUES = ("auto", "textile", "markdown", "common_mark", "none")
+
+
+def get_text_formatting() -> str:
+    """Which markup the Redmine server renders text with (#440).
+
+    Redmine renders notes, descriptions, wiki pages and news with one global
+    Text formatting setting, and the REST API has no settings endpoint, so
+    the server cannot ask for it. ``auto`` (the default) detects it once from
+    an issue page; any other value pins it and skips detection.
+    """
+    value = os.getenv("REDMINE_TEXT_FORMATTING", "").strip().lower() or "auto"
+    if value not in TEXT_FORMATTING_VALUES:
+        raise RuntimeError(
+            "REDMINE_TEXT_FORMATTING must be one of "
+            f"{', '.join(TEXT_FORMATTING_VALUES)}, got '{value}'."
         )
     return value
 
@@ -124,6 +174,7 @@ SERVER_INFO_PLUGIN_FLAGS: dict[str, Callable[[], bool]] = {
     "agile": _is_agile_enabled,
     "checklists": _is_checklists_enabled,
     "products": _is_products_enabled,
+    "orders": _is_orders_enabled,
     "crm": _is_crm_enabled,
     "deals": _is_deals_enabled,
     "dmsf": _is_dmsf_enabled,

@@ -266,16 +266,44 @@ Notes:
   `enforce_configured_scopes`, so on Light a deal scope cannot be held by
   the OAuth application and requesting it fails consent with
   `invalid_scope` -- which would break `manage_contact` too.
+- Either CRM flag advertises the note scopes `add_notes`, `delete_notes`
+  and `delete_own_notes` unless the server is read-only. CRM PRO 4.5.1
+  checks `edit_notes` (or `edit_own_notes`) for editing a note instead,
+  and those two are advertised only with `REDMINE_CRM_NOTE_EDIT_SCOPES=true`
+  on top, because earlier CRM versions do not define them and the REST API
+  gives the server no way to tell the version. Tick both on the Redmine
+  OAuth application before turning the flag on; a token issued without them
+  keeps getting access denied on `manage_crm_note(action="update")` until
+  the client re-authorizes.
+- `REDMINE_HELPDESK_ENABLED` advertises `send_response` unless the server is
+  read-only, because Helpdesk 4.5 denies `send_helpdesk_email_reply` without
+  it. Tick it on the Redmine OAuth application before turning the flag on or
+  upgrading, or narrow `REDMINE_MCP_SCOPES`; otherwise consent fails with
+  `invalid_scope`. A token issued without it keeps getting `FORBIDDEN` on
+  Helpdesk 4.5 until the client re-authorizes. The tool does not require the
+  scope, so tokens without it can still send on older Helpdesk versions.
 - `manage_helpdesk_ticket` sits behind `REDMINE_HELPDESK_TICKETS_ENABLED`,
   which advertises `view_helpdesk_tickets`, `view_contacts` and
   `view_private_contacts`, plus `edit_helpdesk_tickets` unless the server is
   read-only. Tick them on the Redmine OAuth application before turning the
   flag on, or narrow `REDMINE_MCP_SCOPES`; otherwise consent fails with
-  `invalid_scope`. `REDMINE_HELPDESK_ENABLED` on its own advertises nothing
-  extra. Unlike the CRM tools, this one does require its scopes (`get`:
+  `invalid_scope`. Unlike the CRM tools, this one does require its scopes (`get`:
   `view_issues` and `view_helpdesk_tickets`; `set_contact` adds
-  `edit_helpdesk_tickets` and `view_contacts`), since they are only
+  `edit_helpdesk_tickets` and `view_contacts`; `create` needs `add_issues`,
+  `view_contacts` and `edit_helpdesk_tickets`), since they are only
   advertised under the flag that also lists the tool.
+- `manage_order` sits behind `REDMINE_ORDERS_ENABLED`, which advertises
+  `view_orders` and `view_orders_list` in both read-only and read-write mode
+  (the tool has no write action). Tick them on the Redmine OAuth application
+  before turning the flag on, or narrow `REDMINE_MCP_SCOPES`; otherwise
+  consent fails with `invalid_scope`. Orders get their own flag rather than
+  riding `REDMINE_PRODUCTS_ENABLED` because the Products plugin declares
+  them as a separate project module with its own permissions. Like
+  `manage_helpdesk_ticket`, the tool requires its scopes (`list`:
+  `view_orders_list`, the permission `orders#index` checks against the token;
+  `get`: `view_orders`). The rows a `list` returns are filtered by
+  `view_orders` on the user's roles, not on the token, so the user still
+  needs that role permission to see any order.
 - A notes-only `update_redmine_issue` call (fields containing nothing but
   `notes` / `private_notes`, no uploads) requires `add_issue_notes` instead
   of `edit_issues`, mirroring Redmine's own note-adding permission.
