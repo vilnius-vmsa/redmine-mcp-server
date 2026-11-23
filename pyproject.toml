@@ -4,7 +4,7 @@ version = "2.19.0"
 description = "MCP server that lets AI assistants manage Redmine issues, projects, wikis, and time tracking"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 keywords = ["redmine", "mcp", "model-context-protocol", "project-management", "server"]
 authors = [
     {name = "Kevin Tan", email = "6021013+jztan@users.noreply.github.com"}
@@ -21,7 +21,6 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -50,8 +49,7 @@ dependencies = [
     #   authlib < 1.9.1 -> CVE-2026-96760 and CVE-2026-114615/114616/116672
     #   dnspython < 2.9.2 -> CVE-2026-128089
     "authlib>=1.9.1",
-    "dnspython>=2.9.2; python_version >= '3.11'",
-    "dnspython>=2.8.0; python_version < '3.11'",
+    "dnspython>=2.9.2",
     "certifi>=2026.10.19",
     "opentelemetry-api>=1.45.1",
 ]

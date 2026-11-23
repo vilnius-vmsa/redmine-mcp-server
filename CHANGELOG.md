@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Python 3.11 is now the minimum supported version. Python 3.10 was removed
+  because it cannot install the patched `dnspython` release required to clear
+  CVE-2026-128089.
+
 ## [2.19.0] - 2026-10-17
 ### Added
 - `REDMINE_MCP_TRANSPORT=stdio` runs the server over stdin/stdout, so a
