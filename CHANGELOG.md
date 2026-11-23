@@ -13,6 +13,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because it cannot install the patched `dnspython` release required to clear
   CVE-2026-128089.
 
+### Upstream synchronization
+- Integrated upstream `v2.23.0` into the fork's `update/upstream-v2.23.0`
+  branch. This includes notification-email hints for write tools, RedmineUP
+  orders, text-formatting detection, CRM/Helpdesk compatibility fixes, and
+  the upstream test coverage for those changes.
+- Retained the fork's production Compose file, immutable image deployment,
+  custom CI/CD workflows, secret handling, and Docker hardening.
+- Raised the dependency floors and regenerated `uv.lock`; the strict
+  dependency audit reports no known vulnerabilities.
+
+### Upgrade impact
+- Deployments must use Python 3.11 or newer. The production Docker image
+  already uses Python 3.13.
+- OAuth deployments should review and re-authorize clients when enabled
+  features advertise new scopes, especially Helpdesk `send_response`, issue
+  note editing, CRM note editing, and RedmineUP order scopes. Unknown scopes
+  must be excluded with `REDMINE_MCP_SCOPES` until the Redmine OAuth
+  application grants them.
+- `REDMINE_TEXT_FORMATTING` and `REDMINE_ORDERS_ENABLED` are optional new
+  settings and remain disabled unless explicitly configured.
+- Rebuild and smoke-test the image before promoting it; no database migration
+  is required.
+
 ## [2.23.0] - 2026-11-21
 ### Added
 - Write tools that make Redmine send email now say so in their description, in
