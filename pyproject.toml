@@ -41,17 +41,19 @@ dependencies = [
     "urllib3>=2.7.0,<3",
     "pyjwt[crypto]>=2.15.0,<3",
     "cryptography>=48.0.1,<51",
-    "joserfc>=1.6.7,<2",
+    "joserfc>=1.7.6,<2",
     # Security floors for transitive dependencies, declared here so they reach
     # the wheel's Requires-Dist metadata for pip installs, not just uv.lock.
     #   certifi < 2026.10.19 -> PYSEC-2026-4320 (via httpx / requests)
     #   opentelemetry-api < 1.45.1 -> CVE-2026-114603 (via fastmcp)
     #   authlib < 1.9.1 -> CVE-2026-96760 and CVE-2026-114615/114616/116672
     #   dnspython < 2.9.2 -> CVE-2026-128089
+    #   joserfc < 1.7.6 -> CVE-2026-119284
+    #   opentelemetry-api < 1.45.2 -> CVE-2026-126360
     "authlib>=1.9.1",
     "dnspython>=2.9.2",
     "certifi>=2026.10.19",
-    "opentelemetry-api>=1.45.1",
+    "opentelemetry-api>=1.45.2",
 ]
 
 [project.urls]
