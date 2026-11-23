@@ -50,18 +50,24 @@ async def test_detect_success():
 
 async def test_detect_no_issues():
     transport = _redmine(issues=())
-    assert await detect_format(KEY_CRED, base_url="https://h", transport=transport) is None
+    assert (
+        await detect_format(KEY_CRED, base_url="https://h", transport=transport) is None
+    )
 
 
 async def test_detect_401():
     transport = httpx.MockTransport(lambda r: httpx.Response(401))
-    assert await detect_format(KEY_CRED, base_url="https://h", transport=transport) is None
+    assert (
+        await detect_format(KEY_CRED, base_url="https://h", transport=transport) is None
+    )
 
 
 async def test_detect_redirect_is_failure():
     seen = []
     transport = _redmine(page_status=302, seen=seen)
-    assert await detect_format(KEY_CRED, base_url="https://h", transport=transport) is None
+    assert (
+        await detect_format(KEY_CRED, base_url="https://h", transport=transport) is None
+    )
     assert not any(r.url.path == "/login" for r in seen)
 
 
@@ -70,7 +76,9 @@ async def test_detect_network_error_is_failure():
         raise httpx.ConnectError("down")
 
     transport = httpx.MockTransport(boom)
-    assert await detect_format(KEY_CRED, base_url="https://h", transport=transport) is None
+    assert (
+        await detect_format(KEY_CRED, base_url="https://h", transport=transport) is None
+    )
 
 
 async def test_detect_keeps_url_subpath():
@@ -190,7 +198,10 @@ async def test_detect_bad_ssl_config_is_failure(monkeypatch):
         raise FileNotFoundError("SSL certificate not found")
 
     monkeypatch.setattr(_client, "httpx_ssl_kwargs", missing_cert)
-    assert await detect_format(KEY_CRED, base_url="https://h", transport=_redmine()) is None
+    assert (
+        await detect_format(KEY_CRED, base_url="https://h", transport=_redmine())
+        is None
+    )
 
 
 async def test_detection_capped_overall():

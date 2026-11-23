@@ -141,7 +141,9 @@ def test_middleware_registered_in_every_mode():
     for provider in (None, object()):
         instance = FastMCP("wiring")
         _register_middlewares(instance, auth_provider=provider)
-        assert "TextFormattingMiddleware" in [type(m).__name__ for m in instance.middleware]
+        assert "TextFormattingMiddleware" in [
+            type(m).__name__ for m in instance.middleware
+        ]
 
 
 def test_invalid_setting_fails_registration(monkeypatch):

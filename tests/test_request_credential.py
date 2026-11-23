@@ -93,7 +93,9 @@ def test_per_user_header():
         patch.object(_client, "REDMINE_AUTH_MODE", "legacy-per-user"),
         patch.object(_client, "get_access_token", return_value=None),
         patch.object(_client, "get_http_request", return_value=req),
-        patch("redmine_mcp_server._per_user.resolve_per_user_key", return_value=VALID_KEY),
+        patch(
+            "redmine_mcp_server._per_user.resolve_per_user_key", return_value=VALID_KEY
+        ),
         patch("redmine_mcp_server._per_user.validate_key_with_redmine") as validate,
     ):
         cred = _client.resolve_request_credential(strict=True)
@@ -106,7 +108,9 @@ def test_per_user_missing_header():
     with (
         patch.object(_client, "REDMINE_AUTH_MODE", "legacy-per-user"),
         patch.object(_client, "get_access_token", return_value=None),
-        patch.object(_client, "get_http_request", side_effect=RuntimeError("no request")),
+        patch.object(
+            _client, "get_http_request", side_effect=RuntimeError("no request")
+        ),
     ):
         with pytest.raises(PerUserAuthError):
             _client.resolve_request_credential(strict=True)

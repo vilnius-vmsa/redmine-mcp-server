@@ -65,7 +65,9 @@ def test_blocks_cover_every_result():
     assert "1. item" in TEXT_BLOCKS["markdown"]
     assert "1. item" in TEXT_BLOCKS["common_mark"]
     assert "# item" in TEXT_BLOCKS["textile"]
-    assert TEXT_BLOCKS["markdown"].startswith("Text formatting on this Redmine: Markdown.")
+    assert TEXT_BLOCKS["markdown"].startswith(
+        "Text formatting on this Redmine: Markdown."
+    )
     assert TEXT_BLOCKS["common_mark"].startswith(
         "Text formatting on this Redmine: CommonMark Markdown."
     )
