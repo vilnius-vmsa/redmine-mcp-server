@@ -15,7 +15,7 @@ Thank you for your interest in contributing to the Redmine MCP Server! This guid
 
 ### Prerequisites
 
-- Python 3.10+ installed
+- Python 3.11+ installed
 - Git installed
 - Access to a Redmine instance (for testing)
 - Familiarity with MCP (Model Context Protocol)
