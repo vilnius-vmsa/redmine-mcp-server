@@ -1,5 +1,5 @@
 # Multi-stage Docker build for the Redmine MCP Server
-FROM python:3.13-slim@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f AS builder
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS builder
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_CACHE_DIR=/opt/uv-cache
 
 # Install uv package manager
-COPY --from=ghcr.io/astral-sh/uv@sha256:10787c682e4184e4f290de1171fd4703dc63de99221f10fe1c99002ce7fa9acc /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv@sha256:d3b601f0c7b118bc1753febf7c41cc80981df678445e0254284eecf84db79a7d /uv /usr/local/bin/uv
 
 # Create and set working directory
 WORKDIR /app
@@ -27,7 +27,7 @@ RUN UV_PROJECT_ENVIRONMENT=/opt/venv \
         /usr/local/bin/pip*
 
 # Production stage
-FROM python:3.13-slim@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f AS runtime
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS runtime
 
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.revision="$VCS_REF"
@@ -48,7 +48,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Install system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        ca-certificates && \
+        ca-certificates \
+        zlib1g && \
     rm -rf /var/lib/apt/lists/* && \
     rm -rf \
         /usr/local/lib/python3.13/site-packages/pip* \
