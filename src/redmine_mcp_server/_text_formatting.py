@@ -145,7 +145,10 @@ async def detect_format(
     if not base.startswith("http"):
         return None
     try:
-        kwargs = {**_client.httpx_ssl_kwargs(), **cred.httpx_kwargs()}
+        # Restrict relaxed TLS settings to the configured Redmine host. The
+        # detector accepts a base URL supplied by the caller, so omitting it
+        # here could apply REDMINE_SSL_VERIFY/REDMINE_SSL_CERT to another host.
+        kwargs = {**_client.httpx_ssl_kwargs(base), **cred.httpx_kwargs()}
         if transport is not None:
             kwargs["transport"] = transport
         async with httpx.AsyncClient(

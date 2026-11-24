@@ -48,6 +48,23 @@ async def test_detect_success():
     assert result == "common_mark"
 
 
+async def test_detect_passes_base_url_to_ssl_configuration(monkeypatch):
+    from redmine_mcp_server import _client
+
+    seen = []
+
+    def ssl_kwargs(url=None):
+        seen.append(url)
+        return {}
+
+    monkeypatch.setattr(_client, "httpx_ssl_kwargs", ssl_kwargs)
+    await detect_format(
+        KEY_CRED, base_url="https://redmine.example/redmine", transport=_redmine()
+    )
+
+    assert seen == ["https://redmine.example/redmine"]
+
+
 async def test_detect_no_issues():
     transport = _redmine(issues=())
     assert (

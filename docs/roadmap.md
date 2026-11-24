@@ -2,7 +2,7 @@
 
 ## Project Status
 
-- **Current Version:** v2.21.0 (released 2026-11-07)
+- **Current Version:** v2.23.0 (released 2026-11-21)
 - **MCP Registry Status:** Published
 - **Test Suite:** 3827 unit tests + 130 integration tests. Integration tests gate on environment: a sandbox Redmine, plugin flags (`REDMINE_AGILE_ENABLED` etc.), and the destructive OAuth test behind `RUN_DESTRUCTIVE_TESTS=1`. Tests that can't run in the current environment skip cleanly with a clear reason. Run them locally with `python tests/run_tests.py --all` or `--integration`.
 - **Tools:** 53 core + 16 plugin-gated + 1 admin-gated (maximum 70 with all flags enabled). The core count includes the two `triage-board` tools (`show_triage_board`, plus the app-only `get_triage_board_data` which is registered but hidden from the model's tool list), the two `project-dashboard` tools (`show_project_dashboard`, plus the app-only `get_project_dashboard_data`), and the two `project-timeline` tools (`show_project_timeline`, plus the app-only `get_project_timeline_data`). Plugin tools are registered with a family tag and hidden from `tools/list` unless their `REDMINE_*_ENABLED` flag is set (their call-time guard also stays); the admin tool is registered only when `REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`.
@@ -80,4 +80,4 @@ For per-release detail (features, fixes, CVE patches, contributor credits, break
 
 ---
 
-**Last Updated:** 2026-11-12
+**Last Updated:** 2026-11-24

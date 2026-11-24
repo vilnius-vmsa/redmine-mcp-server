@@ -297,16 +297,15 @@ def _list_deals_action(
                 "positive integer."
             )
         }
-    # Refused rather than read as "no fields", as on `manage_contact`: leaving
-    # the parameter out already means that.
+    # An empty list explicitly requests no custom fields; leaving the
+    # parameter out keeps the default elided shape with a count.
     if custom_field_ids is not None and (
         not isinstance(custom_field_ids, list)
-        or not custom_field_ids
         or not all(_is_positive_int(cf_id) for cf_id in custom_field_ids)
     ):
         return {
             "error": (
-                "custom_field_ids must be a non-empty list of positive integer "
+                "custom_field_ids must be a list of positive integer "
                 "custom field IDs."
             )
         }

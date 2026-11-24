@@ -890,7 +890,19 @@ class TestManageDealCustomFields:
         assert result[0]["custom_fields"] == []
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("bad", [[], [0], [-1], [True], ["4"], "4"])
+    @patch("redmine_mcp_server._client.REDMINE_URL", "http://localhost:3000")
+    @patch("redmine_mcp_server._client.redmine")
+    async def test_list_empty_ids_explicitly_returns_no_fields(self, mock_redmine):
+        mock_redmine.engine.request.return_value = {
+            "deals": [_make_deal_with_custom_fields()]
+        }
+        with patch.dict(os.environ, {"REDMINE_DEALS_ENABLED": "true"}):
+            result = await manage_deal(action="list", custom_field_ids=[])
+
+        assert result[0]["custom_fields"] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", [[0], [-1], [True], ["4"], "4"])
     async def test_list_rejects_invalid_custom_field_ids(self, bad):
         with patch.dict(os.environ, {"REDMINE_DEALS_ENABLED": "true"}):
             result = await manage_deal(action="list", custom_field_ids=bad)
