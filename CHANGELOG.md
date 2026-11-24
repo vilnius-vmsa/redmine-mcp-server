@@ -13,6 +13,236 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because it cannot install the patched `dnspython` release required to clear
   CVE-2026-128089.
 
+### Upstream synchronization
+- Integrated upstream `v2.23.0` into the fork's `update/upstream-v2.23.0`
+  branch. This includes notification-email hints for write tools, RedmineUP
+  orders, text-formatting detection, CRM/Helpdesk compatibility fixes, and
+  the upstream test coverage for those changes.
+- Retained the fork's production Compose file, immutable image deployment,
+  custom CI/CD workflows, secret handling, and Docker hardening.
+- Raised the dependency floors and regenerated `uv.lock`; the strict
+  dependency audit reports no known vulnerabilities.
+
+### Upgrade impact
+- Deployments must use Python 3.11 or newer. The production Docker image
+  already uses Python 3.13.
+- OAuth deployments should review and re-authorize clients when enabled
+  features advertise new scopes, especially Helpdesk `send_response`, issue
+  note editing, CRM note editing, and RedmineUP order scopes. Unknown scopes
+  must be excluded with `REDMINE_MCP_SCOPES` until the Redmine OAuth
+  application grants them.
+- `REDMINE_TEXT_FORMATTING` and `REDMINE_ORDERS_ENABLED` are optional new
+  settings and remain disabled unless explicitly configured.
+- Rebuild and smoke-test the image before promoting it; no database migration
+  is required.
+
+## [2.23.0] - 2026-11-21
+### Added
+- Write tools that make Redmine send email now say so in their description, in
+  a short sentence that starts with `Email:`, for example on
+  `update_redmine_issue`: "Put every change to one issue (fields, status,
+  assignee, note) into one call: three calls send three emails". Redmine's
+  REST API has no flag to suppress notifications for a single request, so
+  fewer calls is the only lever, and a model that split one task into three
+  calls had no way to know it was sending three emails. `_notifications.py`
+  holds the per-tool table, next to the `TOOL_KINDS` table it mirrors, and an
+  anti-drift test makes every write tool declare an answer. Tools that mail
+  nobody, or only after an administrator has switched that notification on,
+  keep their description unchanged, and so do the plugin tools nobody has
+  checked yet. `docs/tool-reference.md` has the table
+  under "Notification Email"
+  ([#401](https://github.com/jztan/redmine-mcp-server/issues/401)).
+
+### Fixed
+- The lock now resolves a single `anyio` 4.16.0. It held a second pin, 4.9.0,
+  for emscripten on Python 3.12 and 3.13, which is affected by PYSEC-2026-4024
+  (process-pool workers can hang on undrained stderr). The server uses no
+  anyio process pools. Normal installs move from 4.14.2 to 4.16.0, and
+  `sniffio` drops out of the lock
+  ([#471](https://github.com/jztan/redmine-mcp-server/issues/471)).
+
+### Contributors
+- @mliebischer, proposed and added the `Email:` hints on write tools that make
+  Redmine send notification email
+  ([#401](https://github.com/jztan/redmine-mcp-server/issues/401),
+  [#468](https://github.com/jztan/redmine-mcp-server/pull/468))
+
+## [2.22.0] - 2026-11-14
+### Added
+- `REDMINE_CRM_NOTE_EDIT_SCOPES`, an opt-in flag for OAuth deployments on
+  CRM PRO 4.5.1 and later. 4.5.1 checks `edit_notes` (or `edit_own_notes` for
+  the author) when a note is edited, but the server did not advertise either
+  scope, so tokens could not hold them and `manage_crm_note(action="update")`
+  was denied for OAuth users. With the flag set, either CRM flag on and the
+  server not read-only, both scopes are advertised. It is opt-in because
+  earlier CRM versions do not define them, and Redmine fails OAuth consent
+  with `invalid_scope` for the whole list if one requested scope is unknown.
+  API-key and legacy auth were never affected. ([#450](https://github.com/jztan/redmine-mcp-server/issues/450))
+
+### Fixed
+- In OAuth mode, `manage_issue_note(action="edit")` now works for a user whose
+  role has only "Edit own notes" (`edit_own_issue_notes`). The server did not
+  request this scope, so Redmine refused the edit of the user's own note. The
+  server now advertises `edit_own_issue_notes`, and the scope check accepts it
+  as an alternative to `edit_issue_notes`. Redmine still checks that the note
+  belongs to the user. **OAuth deployments: before starting the upgraded
+  server, grant Edit own notes (`edit_own_issue_notes`) on the Redmine OAuth
+  application and have users re-authorize**, or new authorizations fail with
+  `invalid_scope` when the server advertises the default scope set.
+  Alternatively set `REDMINE_MCP_SCOPES` to a list that omits
+  `edit_own_issue_notes` until the application is ready.
+  ([#460](https://github.com/jztan/redmine-mcp-server/issues/460))
+
+### Security
+- `authlib` is now 1.9.5 or later, clearing GHSA-f3fg-34g9-v7jx,
+  GHSA-gp2m-377p-m4j3, GHSA-f7j6-p4qx-gq99 and GHSA-9qr6-8289-9j56. The
+  server does not import Authlib, and `fastmcp` uses none of the affected
+  code. The `fastmcp` floor rises to 4.1.7, which requires the patched
+  Authlib itself, so installs from PyPI get it too and not only the lock. The
+  lock moves to `fastmcp` 4.1.8 and `joserfc` 1.8.0
+  ([#458](https://github.com/jztan/redmine-mcp-server/issues/458)).
+- `dnspython` is now 2.9.2 or later, clearing CVE-2026-128089 (memory and CPU
+  exhaustion when parsing a crafted WKS record from a zone file). It comes in
+  through `email-validator`, and the server parses no zone files. PyPI
+  installs already resolved 2.9.2; this moves the lock.
+
+### Contributors
+- @mival, reported and fixed `manage_issue_note(action="edit")` failing
+  under OAuth for roles with only "Edit own notes"
+  ([#460](https://github.com/jztan/redmine-mcp-server/issues/460),
+  [#461](https://github.com/jztan/redmine-mcp-server/pull/461))
+
+## [2.21.0] - 2026-11-07
+### Added
+- `manage_order` lists and reads the orders of the RedmineUP Products plugin,
+  behind a new flag, `REDMINE_ORDERS_ENABLED`. It is read-only (`list`, `get`).
+  `list` filters by project, contact, status and search, pages with
+  `limit`/`offset` and always returns `{"orders": [...], "pagination": {...}}`;
+  like `manage_deal`, it returns only open orders unless `status_id` says
+  otherwise. `include` adds product lines, and on `get` comments and
+  attachments. Custom field values follow `manage_contact`: opt-in on `list`,
+  always on `get`. The flag is separate from `REDMINE_PRODUCTS_ENABLED`
+  because the plugin declares orders as their own project module with their
+  own permissions, and under OAuth it advertises `view_orders` and
+  `view_orders_list`, which the Redmine OAuth application must grant first. ([#443](https://github.com/jztan/redmine-mcp-server/issues/443))
+- The text-writing tools now tell the model which markup the Redmine server
+  renders (Textile, Markdown, CommonMark or none), so it stops writing, for
+  example, a Textile `# item` list that Markdown turns into headings. The
+  server reads the setting once from an issue page, or from the new
+  `REDMINE_TEXT_FORMATTING` variable; when it can't tell, the model is told
+  to write plain text. `get_mcp_server_info` reports it as `text_formatting`.
+  ([#440](https://github.com/jztan/redmine-mcp-server/issues/440))
+- Python 3.15 support: 3.15 is now in the CI test matrix and declared in the
+  package classifiers. The locked `rpds-py` moves from 0.27.1 to 2026.9.1 and
+  `pydantic` from 2.12.5 to 2.14.2 (`pydantic-core` 2.41.5 to 2.50.2), the
+  versions that install on 3.15.
+  ([#432](https://github.com/jztan/redmine-mcp-server/issues/432))
+- `manage_deal(action="list")` takes two new parameters:
+  - `contact_id` returns only the deals whose contact is that contact, through
+    the `contact_id` filter the CRM plugin's `DealQuery` registers, so it
+    combines with the other `list` filters, including the open-only `status_id`
+    default. `manage_contact(action="get", include="deals")` is not the same
+    read: it also returns the deals the contact is only related to, has no
+    filters or paging, and returns a reduced deal shape. The parameter already
+    existed for `create`.
+  - `offset` pages past the first 100 deals, which was as far as `list` could
+    read. The return value is still a bare list, so existing callers are
+    unaffected; a page shorter than `limit` is the last one. ([#442](https://github.com/jztan/redmine-mcp-server/issues/442))
+
+### Removed
+- Python 3.10 support: the minimum is now Python 3.11. Python 3.10 reached end
+  of life in October 2026, and the fix for CVE-2026-114605 in `dnspython` 2.9.0
+  needs Python 3.11. `dnspython` now has a `>=2.9.0` floor, and
+  `scripts/audit.sh` no longer ignores that CVE. The Docker image is unchanged
+  on Python 3.13. ([#428](https://github.com/jztan/redmine-mcp-server/issues/428))
+### Fixed
+- CRM PRO 4.5.1 compatibility ([#448](https://github.com/jztan/redmine-mcp-server/issues/448)):
+  - `list_contact_tags` failed with `NOT_FOUND` because 4.5.1 removed
+    `GET /contacts_tags.json`. When that endpoint answers 404, the tool now
+    collects the tag names from the contacts the user can see. The plugin
+    gives no tag id or color that way, so both come back as `null`.
+  - `manage_crm_note` permission hints: 4.5.1 checks the new `edit_notes`
+    (or `edit_own_notes`) permission for editing, while `delete_notes` only
+    covers deleting. The access-denied message for `update` now names the
+    edit permission, and the one for `delete` names only the delete
+    permission.
+- `manage_deal` now returns deal `custom_fields`. The CRM plugin renders them
+  on both `deals/index.api.rsb` and `deals/show.api.rsb`, but the serializer
+  dropped them, so a deal's custom field values could be written and never
+  read back. They follow `manage_contact`'s contract: `get` and `create`
+  return them always, while `list` returns `custom_fields: null` beside
+  `custom_fields_count` unless `include_custom_fields=True` asks for every
+  value or `custom_field_ids` names the ones wanted, since every deal custom
+  field is rendered on every row. ([#441](https://github.com/jztan/redmine-mcp-server/issues/441))
+- `import redmine_mcp_server.extensions` no longer crashes on Python 3.11, which
+  broke `REDMINE_MCP_EXTENSIONS` there since v2.17.0. CI now runs each matrix
+  job on the Python it names instead of 3.13.
+  ([#427](https://github.com/jztan/redmine-mcp-server/issues/427))
+- `send_helpdesk_email_reply` failed with `FORBIDDEN` under OAuth on Helpdesk
+  4.5, even for a user whose role grants "Send response", because tokens
+  obtained through discovery never included the permission.
+  `REDMINE_HELPDESK_ENABLED` now advertises `send_response` unless the server
+  is read-only. **Upgrade note:** an OAuth
+  application with a restricted scope list must grant `send_response` before
+  this upgrade, or narrow `REDMINE_MCP_SCOPES`, otherwise consent fails with
+  `invalid_scope`. Clients must re-authorize to get a token with the scope.
+  ([#431](https://github.com/jztan/redmine-mcp-server/issues/431))
+
+### Contributors
+- @slidonnici, reported `send_helpdesk_email_reply` failing under OAuth on
+  Helpdesk 4.5 and identified the missing `send_response` scope
+  ([#431](https://github.com/jztan/redmine-mcp-server/issues/431))
+- @mmahmed, reported and fixed `manage_deal` dropping deal custom fields
+  ([#441](https://github.com/jztan/redmine-mcp-server/issues/441),
+  [#444](https://github.com/jztan/redmine-mcp-server/pull/444)), added the
+  `contact_id` filter and `offset` to `manage_deal(action="list")`
+  ([#442](https://github.com/jztan/redmine-mcp-server/issues/442),
+  [#445](https://github.com/jztan/redmine-mcp-server/pull/445)), and added the
+  read-only `manage_order` tool for RedmineUP Products orders
+  ([#443](https://github.com/jztan/redmine-mcp-server/issues/443),
+  [#446](https://github.com/jztan/redmine-mcp-server/pull/446))
+
+## [2.20.0] - 2026-10-31
+### Added
+- `manage_helpdesk_ticket(action="create")` opens a RedmineUP Helpdesk ticket
+  for an existing contact in one call, instead of `create_redmine_issue`
+  followed by `set_contact`. The contact must already be linked to the
+  project and have an email address; the tool never creates a contact
+  and never emails the customer. Takes the issue's subject,
+  description, tracker, priority, assignee and custom fields, plus the
+  ticket's `source`, `cc_address` and `ticket_date`. Under OAuth it needs
+  `add_issues`, `view_contacts` and `edit_helpdesk_tickets`. Because
+  `create` is not idempotent, the tool's annotation drops `idempotentHint`
+  ([#395](https://github.com/jztan/redmine-mcp-server/issues/395)).
+
+### Fixed
+- Helpdesk 4.4.0 renamed "customer" to "contact" in its API, which broke two
+  things. `manage_helpdesk_ticket` always returned
+  `last_customer_response_at: null`, and `send_helpdesk_email_reply` on an
+  issue with no contact lost its "not a Helpdesk ticket" error. Both now work
+  on old and new plugin versions, and the result still uses the key
+  `last_customer_response_at`
+  ([#423](https://github.com/jztan/redmine-mcp-server/issues/423)).
+- `send_helpdesk_email_reply` told the caller to check that the plugin was
+  installed when replying to an unknown or invisible issue on Helpdesk 4.5.0,
+  which answers those with a 404. It now looks the issue up on a 404 and
+  reports the issue as not found. The tool docs now cover the `send_response`
+  permission 4.5.0 requires and the null contact `id` it can return
+  ([#425](https://github.com/jztan/redmine-mcp-server/issues/425)).
+- Raised the dependency floors to clear 16 advisories from the dependency
+  audit: `fastmcp` to `>=4.1.2` and `joserfc` to `>=1.7.6`, plus
+  `constraint-dependencies` entries for the transitive `authlib` (`>=1.9.1`),
+  `certifi` (`>=2026.10.18`) and `opentelemetry-api` (`>=1.45.1`). The lock
+  also moves `dnspython` to 2.9.1 on Python 3.11 and later. Python 3.10 stays
+  on `dnspython` 2.8.0 with CVE-2026-114605, because the fix needs Python 3.11.
+  `dnspython` only comes in through `email-validator`, which pydantic calls
+  with `check_deliverability=False`, so `scripts/audit.sh` ignores that CVE
+  until Python 3.10 support is dropped.
+
+### Contributors
+- @goizper requested the create action and documented the endpoint from the
+  plugin source ([#395](https://github.com/jztan/redmine-mcp-server/issues/395))
+
 ## [2.19.0] - 2026-10-17
 ### Added
 - `REDMINE_MCP_TRANSPORT=stdio` runs the server over stdin/stdout, so a
@@ -2438,6 +2668,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive authentication support (username/password and API key)
 - Docker containerization support
 
+[2.23.0]: https://github.com/jztan/redmine-mcp-server/releases/tag/v2.23.0
+[2.22.0]: https://github.com/jztan/redmine-mcp-server/releases/tag/v2.22.0
+[2.21.0]: https://github.com/jztan/redmine-mcp-server/releases/tag/v2.21.0
+[2.20.0]: https://github.com/jztan/redmine-mcp-server/releases/tag/v2.20.0
 [2.19.0]: https://github.com/jztan/redmine-mcp-server/releases/tag/v2.19.0
 [2.18.1]: https://github.com/jztan/redmine-mcp-server/releases/tag/v2.18.1
 [2.18.0]: https://github.com/jztan/redmine-mcp-server/releases/tag/v2.18.0

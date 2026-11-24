@@ -10,7 +10,7 @@
 #   bash scripts/audit.sh -r /tmp/requirements-audit.txt --strict
 #
 # Ignored vulnerabilities (no upstream fix, or false-positive for our usage):
-#   (none currently — add lines below as needed, with CVE id and justification)
+#   (none currently: add lines below as needed, with CVE id and justification)
 set -e
 
 # CI uses `uv tool run`, which installs a tool in an isolated ephemeral

@@ -113,15 +113,23 @@ async def get_mcp_server_info() -> Dict[str, Any]:
           Redmine (check ``/health`` for connectivity status).
         - ``plugin_flags`` (dict[str, bool]): which plugin-gated tool
           families are enabled. Always ``agile``, ``checklists``,
-          ``products``, ``crm``, ``deals``, ``dmsf``, ``helpdesk``,
-          ``helpdesk_tickets``, ``tags``, in that order, and after them
-          one key per family this deployment added through
-          ``REDMINE_MCP_EXTENSIONS``, named after the family. The nine are
+          ``products``, ``orders``, ``crm``, ``deals``, ``dmsf``,
+          ``helpdesk``, ``helpdesk_tickets``, ``tags``, in that order, and
+          after them one key per family this deployment added through
+          ``REDMINE_MCP_EXTENSIONS``, named after the family. The ten are
           reserved, so each always carries its own flag.
           ``True`` means the family's tools are listed and routable;
           ``False`` means they are hidden from ``tools/list`` (``agile``
           and ``tags`` only add fields to core tools and are never
           hidden).
+        - ``text_formatting`` (str): the markup Redmine renders text
+          with: ``textile``, ``markdown``, ``common_mark``, ``none``, or
+          ``unknown`` when it could not be determined (then write plain
+          text). The text-writing tools' descriptions carry the matching
+          syntax rules.
+        - ``text_formatting_source`` (str): ``env`` (set by
+          ``REDMINE_TEXT_FORMATTING``), ``detected`` (read from an issue
+          page), or ``unknown``.
 
     The response intentionally excludes credentials, internal
     hostnames, file-system paths, and any other operator-config that
@@ -142,10 +150,15 @@ async def get_mcp_server_info() -> Dict[str, Any]:
                 "dmsf": True,
                 "tags": False,
             },
+            "text_formatting": "markdown",
+            "text_formatting_source": "detected",
         }
     """
     import os
 
+    from .._text_formatting import current_format
+
+    formatting = await current_format()
     return {
         "server_version": __version__,
         "read_only_mode": _is_read_only_mode(),
@@ -158,4 +171,6 @@ async def get_mcp_server_info() -> Dict[str, Any]:
             },
             **{spec.family: spec.enabled() for spec in REGISTERED_EXTENSIONS},
         },
+        "text_formatting": formatting.value,
+        "text_formatting_source": formatting.source,
     }

@@ -17,7 +17,9 @@ listed:
 |---|---|---|
 | `REDMINE_AGILE_ENABLED` | RedmineUP Agile (Light) | 1.6.13 |
 | `REDMINE_CRM_ENABLED`, `REDMINE_DEALS_ENABLED` | RedmineUP CRM PRO | 4.4.7 |
+| `REDMINE_CRM_NOTE_EDIT_SCOPES` | RedmineUP CRM PRO | 4.5.1 (scope names) |
 | `REDMINE_PRODUCTS_ENABLED` | RedmineUP Products | 2.2.9 |
+| `REDMINE_ORDERS_ENABLED` | RedmineUP Products | 2.2.7 |
 | `REDMINE_TAGS_ENABLED` | AlphaNodes additional_tags | 4.4.0 |
 | (wiki macro) | redmine_drawio | 1.5.5 |
 
@@ -83,6 +85,28 @@ Codes returned before a request is made:
 Some tools return their own codes, such as `CONFIRMATION_REQUIRED`,
 `CHILDREN_PRESENT` or `UPDATE_UNCONFIRMED`; each is documented with its tool
 below.
+
+## Notification Email
+
+Redmine sends an email after every successful change to an issue, and its
+REST API has no flag to suppress that for a single request. The tools that
+cause such mail say so in their description, in a short sentence that starts
+with `Email:`, so the model can put all changes to one issue into one call.
+
+| Tool | Email |
+|---|---|
+| `create_redmine_issue`, `update_redmine_issue`, `copy_issue` | yes, and a subtask also mails its parent issue |
+| `delete_redmine_issue` | only for a subtask, to its parent issue |
+| `manage_issue_relation` (`create`, `delete`) | yes, on both issues |
+| `create_checklist_item`, `update_checklist_item` | yes, when the RedmineUP Checklists setting that writes checklist changes to the issue history is on |
+| `send_helpdesk_email_reply` | yes, to the ticket's customer |
+| `manage_redmine_wiki_page` (`create`, `update`), `manage_redmine_news` (`create`), `upload_file` | only when an administrator has switched on that notification in Redmine, so no sentence in the description |
+| All other write tools of Redmine itself | no |
+| `manage_document` (DMSF), `manage_helpdesk_ticket`, and the CRM and Products tools | not checked yet |
+
+Who gets the mail depends on the notification settings in Redmine and on each
+user's own setting, which the REST API does not show. The table lives in
+`src/redmine_mcp_server/_notifications.py`.
 
 ## Security Best Practices
 
@@ -271,9 +295,9 @@ instead of executing (write actions only — read actions within the same tool s
 - `manage_deal_category`: `create`, `update`, `delete` blocked; `list` allowed (also requires `REDMINE_DEALS_ENABLED=true`)
 - `manage_crm_note`: `create`, `update`, `delete` blocked; `get` allowed (also requires `REDMINE_CRM_ENABLED=true` or `REDMINE_DEALS_ENABLED=true`)
 - `manage_document` — `create`, `update` blocked; `list`, `get` allowed (also requires `REDMINE_DMSF_ENABLED=true`)
-- `manage_helpdesk_ticket`: `set_contact` blocked; `get` allowed (also requires `REDMINE_HELPDESK_TICKETS_ENABLED=true`)
+- `manage_helpdesk_ticket`: `set_contact`, `create` blocked; `get` allowed (also requires `REDMINE_HELPDESK_TICKETS_ENABLED=true`)
 
-All read tools (`get_redmine_issue`, `list_redmine_issues`, `list_redmine_projects`, etc.) continue to work normally. The admin-gated `cleanup_attachment_files` tool (when registered via `REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`) is also unaffected — it performs local filesystem cleanup, not Redmine mutations.
+All read tools (`get_redmine_issue`, `list_redmine_issues`, `list_redmine_projects`, etc.) continue to work normally. `manage_order` has only read actions (`list`, `get`), so read-only mode leaves it untouched. The admin-gated `cleanup_attachment_files` tool (when registered via `REDMINE_MCP_EXPOSE_ADMIN_TOOLS=true`) is also unaffected — it performs local filesystem cleanup, not Redmine mutations.
 
 ### Tool Allow List
 
@@ -2500,7 +2524,7 @@ manage_redmine_wiki_page(
 **Notes:**
 - `list` and `get` are allowed in read-only mode; `create`, `update`, `delete`, and `rename` are blocked when `REDMINE_MCP_READ_ONLY=true`.
 - Wiki page titles typically use underscores instead of spaces.
-- Content format (Textile/Markdown) depends on Redmine server configuration.
+- Content format depends on the Redmine server's Text formatting setting (Textile, Markdown, CommonMark or none). The tool's description states which syntax this server renders; `get_mcp_server_info` returns it as `text_formatting`. See `REDMINE_TEXT_FORMATTING`.
 - Use `get_redmine_attachment` to download wiki attachments.
 - `rename` requires the `rename_wiki_pages` permission. If the API user lacks it, Redmine **silently drops the title change** (the body still updates). The tool re-fetches the page at `new_title` after the update and returns an explicit error if the new title is unreachable.
 - The `rename` action implements `PUT /projects/{id}/wiki/{old_title}.json` and fetches the existing text automatically since Redmine requires `text` on every wiki update.
@@ -3027,7 +3051,7 @@ Use cases: "What's the current timeline for project X?", "Which issues are overd
 
 ## Products (RedmineUP Products plugin)
 
-These tools require the **RedmineUP Products** plugin and `REDMINE_PRODUCTS_ENABLED=true`.
+These tools require the **RedmineUP Products** plugin. `manage_product` needs `REDMINE_PRODUCTS_ENABLED=true`; `manage_order` needs `REDMINE_ORDERS_ENABLED=true`.
 
 ### `manage_product`
 
@@ -3083,6 +3107,55 @@ manage_product(action="update", product_id=42, fields={"price": 39.99})
 **Notes:**
 - `list` and `get` are allowed in read-only mode; `create` and `update` are blocked when `REDMINE_MCP_READ_ONLY=true`.
 - The plugin does not expose a delete endpoint, so `manage_product` has no `delete` action.
+
+---
+
+### `manage_order`
+
+List or read the orders of the RedmineUP Products plugin. Read-only: there is no write action.
+
+Requires the **RedmineUP Products** plugin, `REDMINE_ORDERS_ENABLED=true`, and the `orders` project module enabled on the project. Orders have their own flag rather than riding `REDMINE_PRODUCTS_ENABLED` because the plugin declares them as a separate project module (`project_module :orders`, next to `:products`) with its own permissions, so a deployment may enable one without the other. In OAuth mode the token must carry `view_orders_list` for `list` and `view_orders` for `get`; enabling the flag advertises both as scopes, and the OAuth application has to grant them.
+
+**Parameters:**
+- `action` (string, required): Allowed: `list`, `get`
+- `project_id` (integer or string, optional): For `list`, restrict to orders in this project and, under Redmine's default "Display subprojects issues on main projects by default" setting, its subprojects (omitted = every order the caller can see)
+- `contact_id` (integer, optional): For `list`, only orders placed by this contact. Sent to Redmine as the `contact` filter, which is what `OrderQuery` calls it
+- `status_id` (integer or string, optional): For `list`, filter by order status. A numeric order status id, or one of `"o"` (open: processing and draft, the default Redmine applies anyway), `"c"` (completed and canceled), `"*"` (any status)
+- `search` (string, optional): For `list`, free-text search over the order number, subject and description and the contact's first name, last name, company and email. Each space-separated word matches on its own (OR), so more words return more orders, not fewer
+- `limit` (integer, optional): For `list`, max results per call (default `100`, capped at 100 by Redmine)
+- `offset` (integer, optional): For `list`, orders to skip, for paging past the first 100 (default `0`)
+- `include` (string, optional): For `list`, `lines` (each order's product lines). For `get`, comma-separated, any of `lines`, `comments`, `attachments`. Any other name is refused rather than silently ignored
+- `include_custom_fields` (boolean, optional): For `list`, return each order's `custom_fields` values (default `false`)
+- `custom_field_ids` (list of integers, optional): For `list`, return only these custom fields in each order's `custom_fields`; implies `include_custom_fields`
+- `order_id` (integer): Required for `get`
+
+**Returns:**
+- `list`: `{"orders": [...], "pagination": {...}}`, always. `pagination` has the keys `list_redmine_issues` returns with `include_pagination_info`: `total`, `limit`, `offset`, `count`, `has_next`, `has_previous`, `next_offset`, `previous_offset`. `total` is Redmine's own `total_count`, which counts the search too, so it stays accurate under `search`. Each order carries `custom_fields: null` plus `custom_fields_count` unless `include_custom_fields` or `custom_field_ids` was given; `null` means "not requested" and `[]` means "this order has none". The Light edition of the Products plugin has no order custom fields and its order API renders none, so there `custom_fields` is always `[]` on `get` and `custom_fields_count` is always `0` on `list`
+- `get`: order dict with `id`, `number`, `subject`, `order_date`, `completed_date`, `amount`, `currency`, `description`, `contact`, `project`, `status` (`{id, name, is_closed}`), `author`, `assigned_to`, `custom_fields` (always), `created_at`, `updated_at`, plus `lines`, `comments` (`{id, text, author, created_on, updated_on}`) and `attachments` when requested. Keys follow the plugin's JSON, so the timestamps are `created_at` / `updated_at`
+- `lines` entries: `{id, position, product, description, quantity, tax, discount, price, total}`; `product` is `{id, name}`, or `null` for a free-form line
+- Error: `{"error": "..."}`
+
+**Examples:**
+
+```python
+# Open orders in a project (open is Redmine's default)
+manage_order(action="list", project_id="sales")
+
+# Every order a contact has placed, whatever its status, with product lines
+manage_order(action="list", contact_id=42, status_id="*", include="lines")
+
+# The next page
+manage_order(action="list", status_id="*", limit=50, offset=50)
+
+# One order with its lines, comments and attachments
+manage_order(action="get", order_id=17, include="lines,comments,attachments")
+```
+
+**Notes:**
+- **`list` returns only OPEN orders unless you ask for more.** `OrderQuery` seeds itself with a `status_id` filter on operator `o` (statuses of type processing or draft), so completed and canceled orders are absent from an unfiltered call. Pass `status_id="*"` for all statuses, `"c"` for completed and canceled, or a numeric id for one status.
+- **`list` needs both permissions on the user's role.** `orders#index` requires `view_orders_list`, checked through `find_optional_project`, and its rows come from `Order.visible`, which filters on the role's `view_orders`. A user whose role holds only `view_orders_list` gets an empty list, not an error. `Order.visible` does not consult the OAuth token, so the token itself needs only `view_orders_list` for `list`. `get` needs `view_orders`.
+- **`lines` is absent when an order has none, even when requested.** The plugin renders the array only for an order that has lines, so on a `list` with `include="lines"` a missing `lines` key means "no lines", not "not requested". `comments` and `attachments` are present (possibly empty) whenever `get` asked for them.
+- `description`, a line's `description` and a comment's `text` are wrapped in `<insecure-content>` boundary tags so downstream LLMs treat them as untrusted data. `number`, `subject` and the `id`/`name` refs are short label-shaped fields and are returned verbatim, matching `subject` on issues.
 
 ---
 
@@ -3222,17 +3295,20 @@ Requires the **RedmineUP CRM** plugin in its **Pro** edition, `REDMINE_DEALS_ENA
 - `status_id` (integer or string, optional): For `list`, filter by deal status. A numeric id, or one of `"o"` (open, the default Redmine applies anyway), `"c"` (won/lost), `"*"` (any status). For `create`, the status to open the deal in (numeric id only)
 - `assigned_to_id` (integer, optional): For `list`, filter by assignee user ID
 - `limit` (integer, optional): For `list`, max results per call (default `100`, capped at 100 by Redmine)
+- `offset` (integer, optional): For `list`, deals to skip — needed to page past the first 100. `list` still returns a bare array, so page by calling again at `offset + limit` until a call returns fewer than `limit` deals; that short page is the last
+- `include_custom_fields` (boolean, optional): For `list`, return each deal's `custom_fields` values. Default: `false`. Costs no extra request -- the plugin's `deals/index.api.rsb` renders every deal custom field on every deal whether or not it carries a value, so the data is already in the payload -- but returning it on every row is the payload cost. Without it a listed deal still carries `custom_fields`, holding `null`, beside `custom_fields_count` saying how many were withheld: `null` means "not requested" and `[]` means "this deal has none". `get` returns the values always
+- `custom_field_ids` (array of integers, optional): For `list`, return only these custom fields in each deal's `custom_fields`, e.g. `[42, 43]`, in the order the payload carries them. Implies `include_custom_fields`. The IDs are each entry's `id`. As with `include_custom_fields`, no `custom_fields_count` comes back, and `[]` means the deal carries none of them; an ID no deal carries is not an error. An empty list is refused
 - `deal_id` (integer): Required for `get`, `update`, and `delete`
 - `include` (string, optional): For `get`, comma-separated includes: `notes`, and `lines` (product lines, when the Products plugin is installed)
 - `name` (string): Required for `create`
-- `contact_id` (integer, optional): For `create`, the contact the deal belongs to
+- `contact_id` (integer, optional): For `list`, return only deals whose contact is this contact ID — `DealQuery`'s `contact_id` filter, which matches the deal's `contact`, not its `related_contacts`. Open deals only unless `status_id` says otherwise. For `create`, the contact the deal belongs to
 - `assigned_to_id` (integer, optional): For `list`, filter by assignee. For `create`, the user to assign the new deal to
 - `price` (number or string, optional), `currency` (string, optional), `due_date` (string, optional): For `create`
 - `fields` (dict): For `update`, fields to update. Allowed keys: `name`, `background`, `currency`, `price`, `price_type`, `duration`, `project_id`, `author_id`, `assigned_to_id`, `status_id`, `contact_id`, `category_id`, `probability`, `due_date`, `custom_field_values`, `custom_fields`, `watcher_user_ids`. For `create`, additional fields beyond the named parameters
 
 **Returns:**
-- `list`: array of deal dicts
-- `get`/`create`: deal dict with `id`, `name`, `price`, `currency`, `price_type`, `duration`, `probability`, `due_date`, `background`, `project`, `status`, `category`, `author`, `contact`, `assigned_to`, `related_contacts`, `created_on`, `updated_on`. A `notes` key is added only when `include="notes"` was requested and the plugin returned notes, so its absence means "not requested" rather than "none". `custom_fields` is accepted on writes but not returned. `manage_product` differs, returning `custom_fields` on `list`, `get` and `create`, as does `manage_document` on `get`; `manage_contact` returns contact `custom_fields` on `get` and `create`, and on `list` under `include_custom_fields` or `custom_field_ids`
+- `list`: array of deal dicts. A listed deal carries `custom_fields` values only under `include_custom_fields=true`, or just the fields named under `custom_field_ids`; otherwise that key is `null` and `custom_fields_count` carries the number withheld
+- `get`/`create`: deal dict with `id`, `name`, `price`, `currency`, `price_type`, `duration`, `probability`, `due_date`, `background`, `project`, `status`, `category`, `author`, `contact`, `assigned_to`, `related_contacts`, `created_on`, `updated_on`, and `custom_fields` (values included, each `{id, name, value}`, with `value` a list for a multi-value field). A `notes` key is added only when `include="notes"` was requested and the plugin returned notes, so its absence means "not requested" rather than "none"
 - `update`: `{"success": true, "deal_id": N, "updated_fields": [...]}`
 - `delete`: `{"success": true, "deal_id": N, "message": ...}`
 - Error: `{"error": "..."}`
@@ -3245,6 +3321,9 @@ manage_deal(action="list", project_id="sales", assigned_to_id=5, limit=50)
 
 # Every deal regardless of status, including won and lost
 manage_deal(action="list", project_id="sales", status_id="*")
+
+# Every deal for one contact, any status, second page of 100
+manage_deal(action="list", contact_id=42, status_id="*", offset=100)
 
 # Fetch a single deal with its notes
 manage_deal(action="get", deal_id=9, include="notes")
@@ -3318,7 +3397,7 @@ Available when `REDMINE_CRM_ENABLED=true` or `REDMINE_DEALS_ENABLED=true`. A not
 
 **Returns:** `get`/`create` a note dict `{id, source {id, name, type}, subject, content, type_id, note_type, author, created_on, updated_on}` (`content` is wrapped in `<insecure-content>` boundary tags, timestamps are ISO-8601); `update` `{success, note_id, updated_fields}`; `delete` `{success, note_id, message}`.
 
-**Permissions:** the plugin checks `delete_notes` (or `delete_own_notes` for the author) for both editing and deleting. In OAuth mode enabling either CRM flag advertises `add_notes`, `delete_notes` and `delete_own_notes` as scopes.
+**Permissions:** deleting needs `delete_notes` (or `delete_own_notes` for the author). Editing needs `edit_notes` (or `edit_own_notes`) on CRM 4.5.1 and later; earlier versions check the delete permissions for editing too. In OAuth mode enabling either CRM flag advertises `add_notes`, `delete_notes` and `delete_own_notes` as scopes. `edit_notes` and `edit_own_notes` are advertised only when `REDMINE_CRM_NOTE_EDIT_SCOPES=true` is also set, because CRM versions before 4.5.1 do not define them and Redmine fails OAuth consent with `invalid_scope` for the whole list if one requested scope is unknown. Without the flag, `update` is denied for OAuth tokens on CRM 4.5.1 and later; API-key and legacy auth are unaffected.
 
 **Example:**
 ```json
@@ -3332,6 +3411,8 @@ List the tags in use on RedmineUP CRM contacts, with their colors. Use it to dis
 Requires `REDMINE_CRM_ENABLED=true`. Read-only. No parameters.
 
 **Returns:** a list of `{id, name, color}` ordered by name.
+
+CRM 4.5.1 removed the plugin's tags endpoint. On those versions the tool collects the names from the `tag_list` of every contact the user can see, paging through the contacts list, and returns `id` and `color` as `null`. On a large CRM that is one request per 100 contacts.
 
 ### `manage_deal_category`
 
@@ -3508,37 +3589,55 @@ send_helpdesk_email_reply(
 **Notes:**
 - Calls `POST /helpdesk/email_note.json`. The plugin documents only the `.xml` form, but the JSON form accepts and returns the same fields.
 - Works only on a Helpdesk ticket, meaning an issue with a customer attached.
-- `customer` comes from the response's `contact` key (Helpdesk 4.3) or `customer` key (Helpdesk 4.2).
-- Under OAuth, the tool requires the `add_issue_notes` scope. The plugin's endpoint itself checks no project role or permission (per a reading of the Helpdesk 4.2.9 controller in [#301](https://github.com/jztan/redmine-mcp-server/issues/301)), so with an API key any authenticated Redmine user can send through it. `REDMINE_HELPDESK_ENABLED` and read-only mode are the server-side gates.
+- `customer` comes from the response's `contact` key (Helpdesk 4.3) or `customer` key (Helpdesk 4.2). On Helpdesk 4.5 its `id` is null when the caller cannot see the contact.
+- Under OAuth, the tool requires the `add_issue_notes` scope, and `REDMINE_HELPDESK_ENABLED` also advertises `send_response`. Helpdesk 4.5 requires `send_response` on the project, in both the caller's role and the token, and an issue the caller can see. Older versions check no project role or permission (per a reading of the Helpdesk 4.2.9 controller in [#301](https://github.com/jztan/redmine-mcp-server/issues/301)), so with an API key any authenticated Redmine user can send through them. `REDMINE_HELPDESK_ENABLED` and read-only mode are the server-side gates.
 
 ### `manage_helpdesk_ticket`
 
-Read a Helpdesk ticket's own data, or move the ticket to another existing contact. `get_redmine_issue` does not return the Helpdesk fields, and `update_redmine_issue` cannot change the ticket's customer (a `customer_id` key is reported in `unverified_fields` and changes nothing).
+Read a Helpdesk ticket's own data, open a new ticket for an existing contact, or move a ticket to another existing contact. `get_redmine_issue` does not return the Helpdesk fields, and `update_redmine_issue` cannot change the ticket's customer (a `customer_id` key is reported in `unverified_fields` and changes nothing).
 
-Requires `REDMINE_HELPDESK_TICKETS_ENABLED=true` and the Helpdesk and CRM plugins. `set_contact` is a **write operation** and is blocked in read-only mode; `get` is not.
+Requires `REDMINE_HELPDESK_TICKETS_ENABLED=true` and the Helpdesk and CRM plugins. `set_contact` and `create` are **write operations** and are blocked in read-only mode; `get` is not.
 
 **Parameters:**
-- `action` (string, required): `get` or `set_contact`
-- `issue_id` (integer, required): the ticket's issue id
-- `contact_id` (integer): `set_contact` only; the contact to assign
-- `email` (string): `set_contact` only; an email address of the contact to assign, matched exactly and case-insensitively among the issue's project's contacts. Give exactly one of `contact_id` and `email`.
+- `action` (string, required): `get`, `set_contact` or `create`
+- `issue_id` (integer): `get` and `set_contact`, required; the ticket's issue id. `create` refuses it.
+- `contact_id` (integer): `set_contact` and `create`; the contact to assign
+- `email` (string): `set_contact` and `create`; an email address of the contact to assign, matched exactly and case-insensitively among the project's contacts. Give exactly one of `contact_id` and `email`.
+- `project_id` (integer): `create`, required; the numeric id of the project to open the ticket in
+- `subject` (string): `create`, required
+- `description` (string): `create`
+- `tracker_id`, `priority_id`, `assigned_to_id` (integer): `create`. Helpdesk may replace `assigned_to_id` with the contact's own assignee when its "assign contact user" setting is on.
+- `custom_fields` (list): `create`; values as `[{"id": 2, "value": "QA"}]`. A project's required custom fields must be set, or Helpdesk refuses the ticket.
+- `source` (string): `create`; one of `email`, `web`, `phone`, `twitter`, `conversation`. Helpdesk uses `web` when omitted.
+- `cc_address` (string): `create`; addresses to copy on later replies
+- `ticket_date` (string): `create`; the request date as `YYYY-MM-DD`, today when omitted
 
-**Returns:** `{issue_id, contact, from_address, to_address, cc_address, message_id, source, is_incoming, ticket_date, reaction_time, first_response_time, resolve_time, last_agent_response_at, last_customer_response_at, vote, vote_comment, content}`, where `contact` is `{id, name}`. `set_contact` adds `previous_contact` (`{id, name}`). If the change went through but the updated ticket cannot be read back, the result carries a `warning`, `contact` holds only the new id, and `previous_contact` is still reported. `contact.name`, `previous_contact.name`, `content`, `vote_comment` and the address and `message_id` fields are wrapped in `<insecure-content>` tags: the plugin copies the addresses and message id from inbound email headers. On failure, `{"error": ...}` naming the step that failed and what to do about it.
+**Returns:** `{issue_id, contact, from_address, to_address, cc_address, message_id, source, is_incoming, ticket_date, reaction_time, first_response_time, resolve_time, last_agent_response_at, last_customer_response_at, vote, vote_comment, content}`, where `contact` is `{id, name}`, with `id` null on Helpdesk 4.5 when the caller cannot see the contact. `set_contact` adds `previous_contact` (`{id, name}`); `create` adds `project_id`, and `issue_id` is the new ticket's issue id. If the change went through but the updated ticket cannot be read back, the result carries a `warning`, `contact` holds only the new id, and `previous_contact` is still reported. `contact.name`, `previous_contact.name`, `content`, `vote_comment` and the address and `message_id` fields are wrapped in `<insecure-content>` tags: the plugin copies the addresses and message id from inbound email headers. On failure, `{"error": ...}` naming the step that failed and what to do about it.
 
 **Example:**
 ```python
 manage_helpdesk_ticket(action="get", issue_id=804)
 manage_helpdesk_ticket(action="set_contact", issue_id=804, email="bob@example.com")
+manage_helpdesk_ticket(
+    action="create",
+    project_id=1,
+    subject="Printer on fire",
+    description="The office printer is smoking.",
+    email="bob@example.com",
+    source="phone",
+)
 ```
 
 **Notes:**
-- Both actions read `GET /issues/<id>.json` first. The plugin's own ticket lookup does not check issue visibility, so this keeps a caller from reading a private issue's description through the ticket.
+- `get` and `set_contact` read `GET /issues/<id>.json` first. The plugin's own ticket lookup does not check issue visibility, so this keeps a caller from reading a private issue's description through the ticket.
 - `set_contact` never creates a contact and never converts a plain issue into a ticket, both of which the plugin's `PUT /helpdesk_tickets/<id>.json` does on its own. It refuses an issue that is not a ticket, and a contact that is unknown, not visible, not linked to the issue's project, or without an email address. The project rule matches the web UI's default; a deployment with the CRM setting `cross_project_contacts` on can link the contact with `manage_contact(action="assign_to_project")` first.
-- An `email` lookup searches the issue's project's contacts, up to 500 of them; a broader match is refused with a request for `contact_id`.
+- `create` calls `POST /helpdesk_tickets.json` for a contact that is already linked to the project and has an email address, the same rule as `set_contact`. It never creates a contact and never emails the customer: the plugin's `send_as` option is not offered. Create a missing contact first with `manage_contact(action="create")`.
+- `create` is not idempotent: calling it again opens a second ticket. If Helpdesk fails with an internal error, the error says the ticket may have been created anyway; check with `list_redmine_issues` before retrying. If the new ticket comes back attached to a different contact, the tool moves it to the checked one and adds a `warning`.
+- An `email` lookup searches the project's contacts, up to 500 of them; a broader match is refused with a request for `contact_id`.
 - After the change, replies go to the contact's **primary** email, even when it was found by a secondary one.
 - Redmine keeps no journal entry for a contact change, so `previous_contact` is the only record of the old value.
 - If someone removes the ticket's Helpdesk record in the moment between the tool's check and its write, the write recreates the record. With the Helpdesk settings "assign contact user" and "create private tickets" both on, that also makes the issue private.
-- OAuth scopes: `get` needs `view_issues` and `view_helpdesk_tickets`; `set_contact` also needs `edit_helpdesk_tickets` and `view_contacts`. The flag advertises `view_helpdesk_tickets`, `view_contacts`, `view_private_contacts` and `edit_helpdesk_tickets` (the last unless read-only).
+- OAuth scopes: `get` needs `view_issues` and `view_helpdesk_tickets`; `set_contact` also needs `edit_helpdesk_tickets` and `view_contacts`; `create` needs `add_issues`, `view_contacts` and `edit_helpdesk_tickets`. The flag advertises `view_helpdesk_tickets`, `view_contacts`, `view_private_contacts` and `edit_helpdesk_tickets` (the last unless read-only).
 
 **Acknowledgement:** RedmineUP provided evaluation copies of the Helpdesk PRO (4.3.1) and CRM PRO (4.5.0) plugins for verifying `send_helpdesk_email_reply` and `manage_helpdesk_ticket` against a real Pro instance on Redmine 6.1.1.
 
@@ -3557,7 +3656,9 @@ Return the MCP server's version, enabled-feature flags, and the identity of the 
 - `read_only_mode` (boolean): whether `REDMINE_MCP_READ_ONLY` is enabled. When `True`, all write tools refuse with the standard read-only error.
 - `auth_mode` (string): `"oauth"` or `"legacy"`.
 - `current_user` (dict or null): `{id, login, name}` for the authenticated Redmine user behind the configured API key. `null` when the server cannot reach Redmine (check `/health` for connectivity status). Use this to confirm who `assigned_to_id="me"` resolves to, which matters when a shared or robot API key is in use.
-- `plugin_flags` (dict): which plugin-gated tool families are enabled. Keys: `agile`, `checklists`, `products`, `crm`, `deals`, `dmsf`, `helpdesk`, `helpdesk_tickets`, `tags`, plus one per family registered by an [extension](extensions.md). `True` means the family's tools are listed and routable and will reach the underlying plugin endpoints (for `tags`, that `get_redmine_issue` returns a `tags` array); `False` means they are hidden from `tools/list` (calling them by name returns "Unknown tool"), except for `agile` and `tags`, which only add fields to core tools and are never hidden (for `tags`, the field is simply omitted).
+- `plugin_flags` (dict): which plugin-gated tool families are enabled. Keys: `agile`, `checklists`, `products`, `orders`, `crm`, `deals`, `dmsf`, `helpdesk`, `helpdesk_tickets`, `tags`, plus one per family registered by an [extension](extensions.md). `True` means the family's tools are listed and routable and will reach the underlying plugin endpoints (for `tags`, that `get_redmine_issue` returns a `tags` array); `False` means they are hidden from `tools/list` (calling them by name returns "Unknown tool"), except for `agile` and `tags`, which only add fields to core tools and are never hidden (for `tags`, the field is simply omitted).
+- `text_formatting` (string): the markup Redmine renders notes, descriptions, wiki pages and news with: `textile`, `markdown`, `common_mark`, `none`, or `unknown` when it could not be determined. With `unknown`, write plain text. The text-writing tools' descriptions carry the matching syntax rules.
+- `text_formatting_source` (string): `env` (set by `REDMINE_TEXT_FORMATTING`), `detected` (read once from an issue page), or `unknown`.
 
 The response intentionally excludes credentials, internal hostnames, file-system paths, and any other operator config that a caller doesn't need to know to choose its call shape. Only flags that change *call shape* are surfaced.
 
@@ -3575,7 +3676,9 @@ The response intentionally excludes credentials, internal hostnames, file-system
         "crm": false,
         "dmsf": true,
         "tags": false
-    }
+    },
+    "text_formatting": "markdown",
+    "text_formatting_source": "detected"
 }
 ```
 

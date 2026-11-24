@@ -42,6 +42,19 @@ _SUCCESS_RESPONSE_4_3 = {
 _ON = {"REDMINE_HELPDESK_ENABLED": "true", "REDMINE_MCP_READ_ONLY": "false"}
 
 
+def _email_note_404_then(lookup):
+    """A fake ``engine.request``: the POST answers 404, the issue GET ``lookup``."""
+
+    def request(method, url, **kwargs):
+        if method == "post":
+            raise ResourceNotFoundError()
+        if isinstance(lookup, Exception):
+            raise lookup
+        return lookup
+
+    return request
+
+
 class TestIsHelpdeskEnabled:
     def test_false_by_default(self):
         with patch.dict(os.environ, {}, clear=False):
@@ -150,17 +163,21 @@ class TestSendHelpdeskEmailReply:
         assert "999999999" in json.dumps(result)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("wording", ["customer", "contact"])
     @patch("redmine_mcp_server._client.redmine")
-    async def test_issue_without_customer_is_named_as_not_a_ticket(self, mock_redmine):
+    async def test_issue_without_customer_is_named_as_not_a_ticket(
+        self, mock_redmine, wording
+    ):
         # Also a 422, told apart from the unknown issue only by its wording.
+        # Helpdesk 4.4 changed "customer" to "contact" in the message.
         mock_redmine.engine.request.side_effect = ValidationError(
-            "Issue with ID: 307 should be present and relate to customer"
+            f"Issue with ID: 307 should be present and relate to {wording}"
         )
         with patch.dict(os.environ, _ON):
             result = await send_helpdesk_email_reply(issue_id=307, content="Hi")
         assert "not a Helpdesk ticket" in result["error"]
         assert "update_redmine_issue" in result["error"]
-        assert "relate to customer" in result["error"]
+        assert f"relate to {wording}" in result["error"]
 
     @pytest.mark.asyncio
     @patch("redmine_mcp_server._client.redmine")
@@ -169,11 +186,42 @@ class TestSendHelpdeskEmailReply:
     ):
         # Without the plugin Redmine answers 404, which must not read as
         # "issue not found" when the issue exists.
-        mock_redmine.engine.request.side_effect = ResourceNotFoundError()
+        mock_redmine.engine.request.side_effect = _email_note_404_then(
+            {"issue": {"id": 307}}
+        )
         with patch.dict(os.environ, _ON):
             result = await send_helpdesk_email_reply(issue_id=307, content="Hi")
         assert "Helpdesk plugin" in result["error"]
         assert "307" not in result["error"]
+
+    @pytest.mark.asyncio
+    @patch("redmine_mcp_server._client.redmine")
+    async def test_unknown_issue_404_is_not_reported_as_missing_plugin(
+        self, mock_redmine
+    ):
+        # Helpdesk 4.5 answers 404 for an unknown or invisible issue, the
+        # same as a missing route (#425).
+        mock_redmine.engine.request.side_effect = _email_note_404_then(
+            ResourceNotFoundError()
+        )
+        with patch.dict(os.environ, _ON):
+            result = await send_helpdesk_email_reply(issue_id=999, content="Hi")
+        assert result["error"] == "Issue 999 not found or not visible to you."
+
+    @pytest.mark.asyncio
+    @patch("redmine_mcp_server._client.redmine")
+    async def test_failed_issue_lookup_is_not_reported_as_missing_plugin(
+        self, mock_redmine
+    ):
+        # The lookup says nothing about the plugin if it fails for another
+        # reason, so the plugin must not get the blame.
+        mock_redmine.engine.request.side_effect = _email_note_404_then(
+            ConnectionError("connection refused")
+        )
+        with patch.dict(os.environ, _ON):
+            result = await send_helpdesk_email_reply(issue_id=307, content="Hi")
+        assert "error" in result
+        assert "Helpdesk plugin" not in result["error"]
 
     @pytest.mark.asyncio
     @patch("redmine_mcp_server._client.redmine")
@@ -213,6 +261,8 @@ class TestSendHelpdeskEmailReply:
 from redmine_mcp_server.oauth_scopes import (  # noqa: E402
     HELPDESK_TICKETS_READ_SCOPES,
     HELPDESK_TICKETS_WRITE_SCOPES,
+    HELPDESK_WRITE_SCOPES,
+    TOOL_SCOPES,
     advertised_scopes,
 )
 
@@ -230,6 +280,7 @@ class TestHelpdeskTicketScopes:
             "view_private_contacts",
         ]
         assert HELPDESK_TICKETS_WRITE_SCOPES == ["edit_helpdesk_tickets"]
+        assert HELPDESK_WRITE_SCOPES == ["send_response"]
 
     def test_not_advertised_when_off(self):
         with patch.dict(os.environ, self._OFF):
@@ -237,16 +288,39 @@ class TestHelpdeskTicketScopes:
         assert "view_helpdesk_tickets" not in scopes
         assert "edit_helpdesk_tickets" not in scopes
 
-    def test_reply_flag_alone_changes_nothing(self):
-        """Upgrading with only REDMINE_HELPDESK_ENABLED set must advertise
-        exactly what it did before #378, or OAuth consent breaks."""
+    def test_reply_flag_alone_advertises_only_send_response(self):
+        """REDMINE_HELPDESK_ENABLED adds the reply permission (#431) and none
+        of the ticket scopes, which stay behind their own flag (#378)."""
         off = {**self._OFF, "REDMINE_HELPDESK_ENABLED": "false"}
         with patch.dict(os.environ, off):
             before = advertised_scopes()
         on = {**self._OFF, "REDMINE_HELPDESK_ENABLED": "true"}
         with patch.dict(os.environ, on):
             after = advertised_scopes()
-        assert after == before
+        assert after == before + ["send_response"]
+
+    def test_reply_scope_absent_when_reply_flag_off(self):
+        env = {
+            **self._OFF,
+            "REDMINE_HELPDESK_ENABLED": "false",
+            "REDMINE_HELPDESK_TICKETS_ENABLED": "true",
+        }
+        with patch.dict(os.environ, env):
+            assert "send_response" not in advertised_scopes()
+
+    def test_read_only_drops_the_reply_scope(self):
+        env = {
+            **self._OFF,
+            "REDMINE_HELPDESK_ENABLED": "true",
+            "REDMINE_MCP_READ_ONLY": "true",
+        }
+        with patch.dict(os.environ, env):
+            assert "send_response" not in advertised_scopes()
+
+    def test_reply_scope_is_not_required(self):
+        """Helpdesk before 4.5 sends without send_response, so requiring it
+        would hide a working tool from tokens issued before #431."""
+        assert TOOL_SCOPES["send_helpdesk_email_reply"] == {"add_issue_notes"}
 
     def test_advertised_when_on(self):
         with patch.dict(

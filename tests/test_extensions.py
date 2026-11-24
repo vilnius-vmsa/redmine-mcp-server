@@ -8,12 +8,14 @@ an extension behind would change what the anti-drift tests in
 ``test_tool_annotations.py`` and ``test_scope_enforcement.py`` count.
 """
 
+import dataclasses
 import importlib
 import logging
 import os
 import subprocess
 import sys
 import uuid
+from types import MappingProxyType
 
 import httpx
 import pytest
@@ -471,6 +473,23 @@ class TestRegistration:
         assert families == ["acme_widgets"]
 
 
+class TestSpecDefaults:
+    def test_no_default_is_a_mapping_proxy(self):
+        """A mappingproxy is unhashable before Python 3.12, and a dataclass
+        refuses an unhashable default when the class is defined, so one here
+        crashes the import of this module on those versions."""
+        defaults = [field.default for field in dataclasses.fields(ExtensionSpec)]
+        assert not any(isinstance(d, MappingProxyType) for d in defaults)
+
+    def test_issue_query_filters_defaults_to_empty_and_read_only(self):
+        spec = ExtensionSpec(
+            family="acme", enabled=lambda: True, tool_kinds={}, tool_scopes={}
+        )
+        assert spec.issue_query_filters == {}
+        with pytest.raises(TypeError):
+            spec.issue_query_filters["cf_1"] = {}
+
+
 class TestStartupLoading:
     def test_misspelled_module_fails_startup(self, monkeypatch):
         monkeypatch.setenv("REDMINE_MCP_EXTENSIONS", "no_such_extension_module")
@@ -852,8 +871,10 @@ class TestAntiDriftWithAnExtensionLoaded:
 
     def test_every_enforced_scope_is_advertised(self, widgets, monkeypatch):
         # Plugin scopes are advertised only under their flag, and the Helpdesk
-        # ticket tool requires scopes of its own, so its flag is on here.
+        # ticket and order tools require scopes of their own, so their flags
+        # are on here.
         monkeypatch.setenv("REDMINE_HELPDESK_TICKETS_ENABLED", "true")
+        monkeypatch.setenv("REDMINE_ORDERS_ENABLED", "true")
         monkeypatch.setenv("REDMINE_MCP_READ_ONLY", "false")
         enforced = set()
         for entry in TOOL_SCOPES.values():

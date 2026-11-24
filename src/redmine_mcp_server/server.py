@@ -21,7 +21,10 @@ import os
 from fastmcp import FastMCP
 
 from ._annotations import annotations_for
-from ._env import _is_scope_enforcement_enabled
+from ._env import _is_scope_enforcement_enabled, get_text_formatting
+from ._notifications_middleware import MailHintMiddleware
+from ._text_formatting import SERVER_INSTRUCTIONS
+from ._text_formatting_middleware import TextFormattingMiddleware
 from ._tool_error_middleware import (
     CleanValidationErrorMiddleware,
     ToolErrorFlagMiddleware,
@@ -138,6 +141,14 @@ def _register_middlewares(mcp_instance, auth_provider) -> None:
     # tool and every middleware registered after it.
     mcp_instance.add_middleware(ToolErrorFlagMiddleware())
     mcp_instance.add_middleware(CleanValidationErrorMiddleware())
+    # Every auth mode: tell the model which markup Redmine renders (#440).
+    # Reading the setting here makes an invalid value fail at startup.
+    get_text_formatting()
+    mcp_instance.add_middleware(TextFormattingMiddleware())
+    # Every auth mode: say which write tools make Redmine send email (#401).
+    # After TextFormattingMiddleware, so the hint is in the description
+    # before the formatting block is appended to it.
+    mcp_instance.add_middleware(MailHintMiddleware())
     if auth_provider is None:
         # Legacy modes carry no OAuth scopes; nothing to enforce.
         return
@@ -192,5 +203,7 @@ class _AnnotatingFastMCP(FastMCP):
         return decorator
 
 
-mcp = _AnnotatingFastMCP("redmine_mcp_tools", auth=AUTH_PROVIDER)
+mcp = _AnnotatingFastMCP(
+    "redmine_mcp_tools", auth=AUTH_PROVIDER, instructions=SERVER_INSTRUCTIONS
+)
 _register_middlewares(mcp, AUTH_PROVIDER)
